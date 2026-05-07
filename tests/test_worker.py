@@ -1099,3 +1099,43 @@ def test_worker_run_stops_when_stop_is_called(
         f"run_pass() called {call_count[0]} time(s); expected 1. "
         "Worker.run() did not respect stop()."
     )
+
+
+# ── Worker.run() startup recovery ────────────────────────────────────────────
+
+
+def test_worker_run_requeues_stuck_working_rows_at_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Worker.run() must call cache.requeue_working() once at startup.
+
+    This ensures rows left in 'working' status by a previous crash are
+    recovered before the first run_pass() call, not polled on every
+    orchestrator tick.
+    """
+    import musictagger.worker as worker_mod
+
+    worker = _make_worker_for_loop_tests(tmp_path)
+
+    requeue_called = [0]
+    original_requeue = worker.cache.requeue_working
+
+    def _counting_requeue() -> int:
+        requeue_called[0] += 1
+        return original_requeue()
+
+    monkeypatch.setattr(worker.cache, "requeue_working", _counting_requeue)
+
+    # Stub run_pass to return 0 immediately so run() exits after one attempt.
+    monkeypatch.setattr(
+        worker_mod.Worker,
+        "run_pass",
+        lambda self, batch_size=20: 0,
+    )
+
+    worker.run(50)
+
+    assert requeue_called[0] == 1, (
+        f"requeue_working() was called {requeue_called[0]} time(s); expected 1. "
+        "Worker.run() must call it exactly once at startup."
+    )

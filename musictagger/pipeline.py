@@ -89,20 +89,31 @@ class Pipeline:
         self.config = config
         self.cache = FileCache(config.db_path)
 
-        # Callback invoked with (source, message) for every log line emitted
-        # by a stage.  Defaults to a no-op; the TUI replaces this with its
-        # RichLog writer.  Called from background threads — implementations
-        # must be thread-safe (e.g. use call_from_thread or a queue).
+        # Callbacks invoked with (source, message) for every log line emitted
+        # by a stage.  Default to no-ops; the TUI replaces these with its
+        # RichLog writers.  Called from background threads — implementations
+        # must be thread-safe (e.g. post_message / call_soon_threadsafe).
+        #
+        # on_log        — plain-text messages; user content must be escaped by
+        #                 the receiver before passing to a markup renderer.
+        # on_log_markup — pre-trusted Rich markup strings (e.g. the worker's
+        #                 scored mood lines).  Receivers must NOT escape these.
+        #                 Defaults to on_log so headless mode gets readable text
+        #                 without needing to handle markup separately.
         self.on_log: Callable[[str, str], None] = lambda source, msg: None
+        self.on_log_markup: Callable[[str, str], None] = self.on_log
 
-        # Build stages, wiring their log callbacks through our on_log.
+        # Build stages, wiring their log callbacks through our on_log /
+        # on_log_markup.  _make_log and _make_log_markup capture self so that
+        # reassigning on_log / on_log_markup after construction takes effect
+        # immediately for all subsequent stage calls.
         self.scanner = Scanner(config, self.cache, self._make_log("scanner"))
         self.inspector = Inspector(config, self.cache, self._make_log("inspector"))
         self.worker = Worker(
             config,
             self.cache,
             self._make_log("worker"),
-            self._make_log("worker"),  # markup log — same sink for now
+            self._make_log_markup("worker"),
         )
         self.cleanup = Cleanup(config, self.cache, self._make_log("cleanup"))
 
@@ -302,7 +313,7 @@ class Pipeline:
     # ── Internal stage launcher ───────────────────────────────────────────────
 
     def _make_log(self, source: str) -> Callable[[str], None]:
-        """Return a log callback that forwards messages to self.on_log."""
+        """Return a plain-text log callback that forwards to self.on_log."""
 
         def _log(msg: str) -> None:
             try:
@@ -311,6 +322,23 @@ class Pipeline:
                 pass  # never let a broken log callback kill a stage thread
 
         return _log
+
+    def _make_log_markup(self, source: str) -> Callable[[str], None]:
+        """Return a markup log callback that forwards to self.on_log_markup.
+
+        Messages passed to this callback are pre-trusted Rich markup strings
+        (e.g. the worker's scored mood lines).  The receiver must NOT escape
+        them.  Captures self so that reassigning on_log_markup after
+        construction takes effect immediately.
+        """
+
+        def _log_markup(msg: str) -> None:
+            try:
+                self.on_log_markup(source, msg)
+            except Exception:
+                pass  # never let a broken log callback kill a stage thread
+
+        return _log_markup
 
     def _launch_stage(self, name: str, target: Callable[[], None]) -> None:
         """Start *target* in a daemon thread, tracking it by *name*."""
@@ -356,10 +384,6 @@ class Pipeline:
         self._check_watchdogs()
 
         # ── Scanner (cron-driven) ──────────────────────────────────────────────
-        # Reset cron after a force-scan (next_scan was set to inf temporarily).
-        if self._next_scan == float("inf") and not self.scanner.running:
-            self._next_scan = _cron_next(self.config.scan_cron)
-
         if now >= self._next_scan and not self.scanner.running:
             self._last_scan = now
             self._next_scan = _cron_next(self.config.scan_cron)
@@ -379,17 +403,6 @@ class Pipeline:
 
         # ── Worker (continuous while queue non-empty) ──────────────────────────
         if not self.worker.running:
-            # Recover rows stuck in 'working' from a crashed/killed previous pass.
-            try:
-                recovered = self.cache.requeue_working()
-                if recovered:
-                    self.cache.flush()
-                    logger.warning(
-                        "Pipeline: requeued {} stuck 'working' row(s)", recovered
-                    )
-            except Exception:
-                pass
-
             enabled = [t for t in TAGS if self.config.tag_cfg(t.name).enabled]
             try:
                 needs = self.cache.needs_work(limit=1, enabled_tags=enabled)
@@ -403,9 +416,6 @@ class Pipeline:
                 )
 
         # ── Cleanup (cron-driven) ──────────────────────────────────────────────
-        if self._next_cleanup == float("inf") and not self.cleanup.running:
-            self._next_cleanup = _cron_next(self.config.cleanup_cron)
-
         if now >= self._next_cleanup and not self.cleanup.running:
             self._last_cleanup = now
             self._next_cleanup = _cron_next(self.config.cleanup_cron)

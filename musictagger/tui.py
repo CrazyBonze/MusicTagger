@@ -622,9 +622,10 @@ class MusicTaggerApp(App):
         self._applog(f"Database={self.config.db_path}")
         self._applog(f"Tags monitored: {', '.join(t.description for t in TAGS)}")
 
-        # Wire the pipeline's log callback to the TUI's activity log.
+        # Wire the pipeline's log callbacks to the TUI's activity log.
         # post_message is thread-safe; stages call on_log from background threads.
         self.pipeline.on_log = self._on_pipeline_log
+        self.pipeline.on_log_markup = self._on_pipeline_log_markup
 
         # Start the pipeline orchestration thread.
         self.pipeline.start()
@@ -637,13 +638,25 @@ class MusicTaggerApp(App):
     # ── Pipeline log callback ─────────────────────────────────────────────────
 
     def _on_pipeline_log(self, source: str, msg: str) -> None:
-        """Receive a log message from the Pipeline and post it to the TUI.
+        """Receive a plain-text log message from the Pipeline.
 
         Called from background stage threads — must be thread-safe.
         post_message uses call_soon_threadsafe internally and is non-blocking.
         """
         try:
             self.post_message(LogEvent(source, msg))
+        except RuntimeError:
+            pass  # App has already stopped; discard the message
+
+    def _on_pipeline_log_markup(self, source: str, msg: str) -> None:
+        """Receive a pre-trusted Rich markup log message from the Pipeline.
+
+        Used for the worker's scored mood/BPM lines which contain [bold],
+        [dim] etc. tags that must reach the RichLog unescaped.
+        Called from background stage threads — must be thread-safe.
+        """
+        try:
+            self.post_message(LogEvent(source, msg, markup=True))
         except RuntimeError:
             pass  # App has already stopped; discard the message
 

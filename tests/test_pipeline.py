@@ -264,6 +264,47 @@ def test_pipeline_on_log_receives_stage_messages(tmp_path: Path) -> None:
     pipeline.close()
 
 
+def test_pipeline_on_log_markup_receives_markup_messages(tmp_path: Path) -> None:
+    """pipeline.on_log_markup is called for markup messages (e.g. worker mood lines)."""
+    from musictagger.pipeline import Pipeline
+
+    config = _make_config(tmp_path)
+    pipeline = Pipeline(config)
+
+    markup_received: list[tuple[str, str]] = []
+    pipeline.on_log_markup = lambda source, msg: markup_received.append((source, msg))
+
+    # Trigger a markup log via the worker's markup log callback.
+    pipeline.worker._log_markup("[dim]Mood:[/dim] [bold]Techno[/bold]")
+
+    assert ("worker", "[dim]Mood:[/dim] [bold]Techno[/bold]") in markup_received
+    pipeline.close()
+
+
+def test_pipeline_on_log_and_on_log_markup_are_independent(tmp_path: Path) -> None:
+    """on_log and on_log_markup route to separate callbacks, not the same one."""
+    from musictagger.pipeline import Pipeline
+
+    config = _make_config(tmp_path)
+    pipeline = Pipeline(config)
+
+    plain_received: list[str] = []
+    markup_received: list[str] = []
+
+    pipeline.on_log = lambda source, msg: plain_received.append(msg)
+    pipeline.on_log_markup = lambda source, msg: markup_received.append(msg)
+
+    pipeline.scanner._log("plain scanner message")
+    pipeline.worker._log_markup("[bold]markup worker message[/bold]")
+
+    assert "plain scanner message" in plain_received
+    assert "[bold]markup worker message[/bold]" in markup_received
+    # Plain messages must NOT appear in the markup sink and vice versa.
+    assert "[bold]markup worker message[/bold]" not in plain_received
+    assert "plain scanner message" not in markup_received
+    pipeline.close()
+
+
 # ── start / join / running ────────────────────────────────────────────────────
 
 

@@ -2018,11 +2018,29 @@ class Worker:
     def run(self, batch_size: int = 20) -> None:
         """Drain the work queue by calling run_pass() until empty.
 
+        Recovers any rows left in 'working' status from a previous crashed or
+        killed pass before starting — these rows would otherwise be silently
+        excluded from needs_work() forever.  Recovery runs exactly once per
+        worker session at startup, not on every tick.
+
         Loops immediately between passes so a full batch triggers the next
         pass without waiting for an external scheduler tick — keeping the
         ML models warm in memory across batches.  Exits when run_pass()
         returns 0 (empty queue) or stop() is called.
         """
+        # One-shot recovery: reset rows stuck in 'working' from a prior crash.
+        try:
+            recovered = self.cache.requeue_working()
+            if recovered:
+                self.cache.flush()
+                logger.warning(
+                    "Worker startup: requeued {} stuck 'working' row(s) "
+                    "from a previous interrupted pass",
+                    recovered,
+                )
+        except Exception as exc:
+            logger.warning("Worker startup requeue_working failed: {}", exc)
+
         while not self._stop_event.is_set():
             processed = self.run_pass(batch_size)
             if processed == 0:
