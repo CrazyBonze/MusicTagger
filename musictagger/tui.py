@@ -576,9 +576,9 @@ class MusicTaggerApp(App):
         self._overview_tick: int = 0
         # Set to True once the user requests quit so action_quit is not re-entered.
         self._quitting: bool = False
-        # Monotonic timestamp of when quit was requested; used by _poll_quit to
-        # enforce a hard exit deadline so a long-running inference pass does not
-        # prevent the app from closing.
+        # Monotonic timestamp of when quit was requested; used by _quit_watcher
+        # to enforce a hard exit deadline so a long-running inference pass does
+        # not prevent the app from closing.
         self._quit_time: float = 0.0
         # Last rendered stats-bar text — used to skip redundant Static.update()
         # calls when nothing has changed between 0.5 s ticks.
@@ -664,6 +664,7 @@ class MusicTaggerApp(App):
         outside Textual's worker machinery, so it never blocks Textual's shutdown
         sequence while awaiting task completion.
         """
+
         def _loop() -> None:
             while not self._stats_stop.is_set():
                 try:
@@ -924,14 +925,18 @@ class MusicTaggerApp(App):
                 else:
                     try:
                         self.post_message(
-                            LogEvent("app", "No error rows with missing tags to requeue")
+                            LogEvent(
+                                "app", "No error rows with missing tags to requeue"
+                            )
                         )
                     except RuntimeError:
                         pass
             except Exception as exc:
                 logger.warning("requeue_errors failed: {}", exc)
 
-        threading.Thread(target=_requeue, name="tui-requeue-errors", daemon=True).start()
+        threading.Thread(
+            target=_requeue, name="tui-requeue-errors", daemon=True
+        ).start()
 
     def action_cycle_view(self) -> None:
         """Toggle between the activity log and the library overview."""
@@ -1005,43 +1010,54 @@ class MusicTaggerApp(App):
         )
 
         if not any_running:
-            # Nothing was active — exit immediately with no overlay.
-            self.exit()
-            return
+            # Nothing was active — exit immediately.
+            self.pipeline.close()
+            import os as _os
 
-        # Show the overlay and poll until all threads are done.
+            _os._exit(0)
+
+        # Show the overlay and launch a daemon thread to wait for stages to
+        # stop and then force-exit.  A daemon thread is used instead of
+        # Textual's set_interval() because Textual's timer loop stops firing
+        # around 9-10 seconds into the quit wait (a Textual internal issue
+        # with screen re-renders blocking the asyncio event loop), making the
+        # timer-based approach unreliable.
         try:
             self.query_one("#quit-overlay", Label).add_class("visible")
         except Exception:
             pass  # Overlay widget not ready — proceed without it
 
-        self.set_interval(0.1, self._poll_quit)
+        threading.Thread(
+            target=self._quit_watcher,
+            name="tui-quit-watcher",
+            daemon=True,
+        ).start()
 
-    # Maximum seconds to wait for background threads to stop after quit is
-    # requested before forcing an immediate exit anyway.  The in-flight file's
-    # DB row is left as 'working'; startup recovery requeues it automatically.
+    # Maximum seconds to wait for background threads to stop before forcing exit.
     _QUIT_TIMEOUT_S: int = 10
 
-    def _poll_quit(self) -> None:
-        """Periodic check — exit once all background threads have stopped.
+    def _quit_watcher(self) -> None:
+        """Wait for all pipeline stages to stop, then force-exit the process.
 
-        If threads have not stopped within _QUIT_TIMEOUT_S seconds of the quit
-        request, force an immediate exit rather than waiting indefinitely for a
-        long-running inference pass (BPM, Essentia) to finish on its own.
+        Runs on a daemon thread so it is independent of Textual's event loop.
+        Polls stage running-flags every 100ms and calls os._exit(0) once all
+        stages have stopped or the timeout is reached.
         """
-        all_stopped = (
-            not self.pipeline.running
-            and not self.scanner.running
-            and not self.inspector.running
-            and not self.worker.running
-            and not self.cleanup.running
-        )
-        timed_out = (time.monotonic() - self._quit_time) > self._QUIT_TIMEOUT_S
+        import os as _os
 
-        if not all_stopped and not timed_out:
-            return
-
-        if timed_out and not all_stopped:
+        deadline = time.monotonic() + self._QUIT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            all_stopped = (
+                not self.pipeline.running
+                and not self.scanner.running
+                and not self.inspector.running
+                and not self.worker.running
+                and not self.cleanup.running
+            )
+            if all_stopped:
+                break
+            time.sleep(0.1)
+        else:
             logger.warning(
                 "Quit timeout ({}s) reached — forcing exit; "
                 "any in-flight work will be requeued on next startup",
@@ -1049,13 +1065,6 @@ class MusicTaggerApp(App):
             )
 
         self.pipeline.close()
-        # Use os._exit() directly rather than self.exit() to bypass Textual's
-        # async shutdown sequence, which hangs indefinitely waiting on internal
-        # widget message pumps to drain.  All application-level cleanup
-        # (SQLite commit+close) is already done by pipeline.close() above.
-        # The _emb_cache read-only connection needs no explicit close —
-        # WAL mode guarantees integrity on abrupt exit.
-        import os as _os
         _os._exit(0)
 
     # ── Worker error handling ──────────────────────────────────────────────────
@@ -1245,7 +1254,7 @@ class MusicTaggerApp(App):
         # We deliberately do NOT block here (no pipeline.close(), no
         # _emb_cache.close()) because on_unmount runs on the asyncio event loop.
         # Any blocking call here stalls Textual's entire shutdown sequence.
-        # Resource cleanup happens in _poll_quit (clean quit) and os._exit(0)
+        # Resource cleanup happens in _quit_watcher (clean quit) and os._exit(0)
         # in _run() (all other paths).
         self._stats_stop.set()
         self.pipeline.stop()
