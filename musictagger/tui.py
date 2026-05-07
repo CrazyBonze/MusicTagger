@@ -1,13 +1,16 @@
-"""TUI application — ties the pipeline together with a live Textual interface."""
+"""TUI application — renders pipeline state with a live Textual interface.
+
+The TUI is a pure display layer.  All orchestration logic (stage lifecycle,
+cron scheduling, watchdogs, stats) lives in Pipeline.  The TUI constructs a
+Pipeline, wires its on_log callback to the RichLog widget, and reads pipeline
+state on each 0.5 s panel-refresh tick.
+"""
 
 from __future__ import annotations
 
 import time
 from collections import deque
 from datetime import datetime
-from typing import Callable
-
-from croniter import croniter
 
 from loguru import logger
 from textual.app import App, ComposeResult
@@ -20,40 +23,10 @@ from rich.markup import escape as markup_escape
 from rich.text import Text
 from textual.widgets import Checkbox, Footer, Header, Label, RichLog, Static
 
-from musictagger.cache import FileCache
-from musictagger.cleanup import Cleanup
 from musictagger.config import Config
 from musictagger.embeddings import EmbeddingCache
-from musictagger.inspector import Inspector
-from musictagger.scanner import Scanner
+from musictagger.pipeline import Pipeline
 from musictagger.tags import TAGS
-from musictagger.worker import Worker
-
-# Maximum seconds a worker pass can run without a heartbeat before the
-# watchdog considers it hung and force-resets the running flag so the
-# orchestrator can launch a fresh pass on the next tick.
-_WORKER_HANG_TIMEOUT_S = 300  # 5 minutes
-
-# Maximum seconds the scanner can go without a heartbeat.  The scanner updates
-# last_activity on every file processed and every directory successfully listed,
-# so this timeout only fires when os.scandir() itself is blocking (NFS stall).
-# The per-directory readdir timeout in scanner.py caps individual directories,
-# but this watchdog catches cases where even that thread is stuck.
-_SCANNER_HANG_TIMEOUT_S = 120  # 2 minutes
-
-
-# ── Scheduling helpers ────────────────────────────────────────────────────────
-
-
-def _cron_next(expr: str) -> float:
-    """Return the next Unix timestamp for a cron expression in local time.
-
-    croniter(expr, float_timestamp).get_next(float) evaluates in UTC, which
-    gives wrong results when the system timezone is not UTC.  Passing a naive
-    local datetime and calling get_next(datetime) keeps everything in local
-    wall-clock time, matching what the user configured.
-    """
-    return croniter(expr, datetime.now()).get_next(datetime).timestamp()
 
 
 # ── Internal messages ──────────────────────────────────────────────────────────
@@ -71,19 +44,6 @@ class LogEvent(Message):
         self.source = source
         self.text = text
         self.markup = markup
-
-
-class StatsUpdate(Message):
-    """A fresh stats snapshot from the background stats-refresh worker.
-
-    Posted via ``post_message`` (non-blocking, thread-safe) rather than
-    ``call_from_thread`` so the background thread never waits for the main
-    thread to process the result.
-    """
-
-    def __init__(self, stats: dict) -> None:
-        super().__init__()
-        self.stats = stats
 
 
 class StoragePanelUpdate(Message):
@@ -578,21 +538,19 @@ class MusicTaggerApp(App):
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.config = config
-        self.cache = FileCache(config.db_path)
 
-        # Each job gets a thread-safe log callback that posts a Textual message
-        self.scanner = Scanner(config, self.cache, self._make_log("scanner"))
-        self.inspector = Inspector(config, self.cache, self._make_log("inspector"))
-        self.worker = Worker(
-            config,
-            self.cache,
-            self._make_log("worker"),
-            self._make_log_markup("worker"),
-        )
-        self.cleanup = Cleanup(config, self.cache, self._make_log("cleanup"))
+        # Pipeline owns all stage lifecycle, orchestration, and cron scheduling.
+        # The TUI wires its on_log callback after mount so post_message is safe.
+        self.pipeline = Pipeline(config)
 
-        self._last_scan: float | None = None
-        self._last_cleanup: float | None = None
+        # Convenience aliases so existing panel-rendering code keeps working
+        # without touching every property access.
+        self.scanner = self.pipeline.scanner
+        self.inspector = self.pipeline.inspector
+        self.worker = self.pipeline.worker
+        self.cleanup = self.pipeline.cleanup
+        self.cache = self.pipeline.cache
+
         # Log filter state: which sources are currently visible.
         # All sources are on by default.  "app" is always shown (system msgs).
         self._active_sources: set[str] = {
@@ -606,18 +564,11 @@ class MusicTaggerApp(App):
         # RichLog so we can redraw it when the user toggles a filter.  Capped
         # at the same max_lines as the RichLog widget to bound memory use.
         self._log_buffer: deque[tuple[str, str]] = deque(maxlen=1000)
-        # Trigger an immediate scan on first run; subsequent runs follow the cron schedule.
-        self._next_scan: float = time.time()
-        # First cleanup fires on the next scheduled cron tick after startup.
-        self._next_cleanup: float = _cron_next(config.cleanup_cron)
-        # Spinner frame counter — incremented on every panel refresh
+        # Spinner frame counter — incremented on every panel refresh.
         self._spin_frame: int = 0
-        # Tags active under the current config — computed once and reused so
-        # stats(), needs_inspection(), and needs_work() all use the same filter.
-        self._enabled_tags = [t for t in TAGS if config.tag_cfg(t.name).enabled]
         # Read-only embeddings cache connection for the overview panel stats.
         # Opened separately from the worker's instance so panel refreshes never
-        # block on the worker's lock.
+        # block on the worker's write lock.
         self._emb_cache = EmbeddingCache(config.embeddings_db_path)
         # Counter used to throttle expensive overview stats (file sizes, SQL
         # aggregates) to once every ~5 s instead of every 0.5 s panel refresh.
@@ -631,35 +582,9 @@ class MusicTaggerApp(App):
         # Last rendered stats-bar text — used to skip redundant Static.update()
         # calls when nothing has changed between 0.5 s ticks.
         self._stats_bar_text: str = ""
-        # Monotonic timestamp of the last successful StatsUpdate.  Used to
-        # surface a staleness warning in the stats bar when the background
-        # refresh stops posting updates (e.g. due to a repeated exception in
-        # _refresh_panels_inner silently swallowed by the guard, or a blocked
-        # stats query thread).
-        self._stats_last_updated: float = 0.0
-        # Guard flag: True while a background cache.stats() call is in flight.
-        # _schedule_stats_refresh checks this and skips launching a new fetch
-        # rather than cancelling the in-progress one.  Cancellation via
-        # exclusive=True would kill a stats query mid-execution if the WAL
-        # checkpoint stalls the lock for longer than the 1 s timer interval,
-        # causing the StatsUpdate to never be posted and the display to freeze.
-        self._stats_refresh_running: bool = False
         # Monotonic timestamp of the last _refresh_panels_inner exception, used
         # to rate-limit TUI activity-log noise to at most once per minute.
         self._panels_error_last_logged: float = 0.0
-        # Read model for the main thread: holds the last result of cache.stats().
-        # Refreshed every ~1 s from a background thread via _schedule_stats_refresh.
-        # All main-thread code (panel refresh, orchestrator) reads from this dict
-        # and never calls cache.stats() directly — keeping the event loop free.
-        self._stats_cache: dict = {
-            "total": 0,
-            "needs_inspection": 0,
-            "needs_work": 0,
-            "in_progress": 0,
-            "errors": 0,
-            "done": 0,
-            "per_tag": {t.name: 0 for t in TAGS},
-        }
 
     # ── Layout ─────────────────────────────────────────────────────────────────
 
@@ -696,81 +621,31 @@ class MusicTaggerApp(App):
         self._applog(f"Started  library={self.config.music_path}")
         self._applog(f"Database={self.config.db_path}")
         self._applog(f"Tags monitored: {', '.join(t.description for t in TAGS)}")
-        # Stats are fetched on a background thread and stored in _stats_cache.
-        # Fire immediately so panels have real data on first render, then repeat
-        # every 1 s.  Panel refresh (0.5 s) and orchestration (5 s) read from
-        # _stats_cache only — they never call cache.stats() on the main thread.
-        self._schedule_stats_refresh()
-        self.set_interval(1.0, self._schedule_stats_refresh)
+
+        # Wire the pipeline's log callback to the TUI's activity log.
+        # post_message is thread-safe; stages call on_log from background threads.
+        self.pipeline.on_log = self._on_pipeline_log
+
+        # Start the pipeline orchestration thread.
+        self.pipeline.start()
+
+        # Panel refresh at 0.5 s — reads pipeline.stats and stage state directly.
+        # No separate background stats-refresh worker or stale-cache indirection.
         self.set_interval(0.5, self._refresh_panels)
-        self.set_interval(5.0, self._orchestrate)
         self._refresh_panels()
 
-    # ── Stats cache ────────────────────────────────────────────────────────────
-    # The main thread never calls cache.stats() directly.  Instead, a 1 s
-    # background worker fetches the result and posts it back as a StatsUpdate
-    # message via post_message (non-blocking, thread-safe).  All panel-refresh
-    # and orchestration code reads from _stats_cache (a plain dict, instant,
-    # no I/O).
-    #
-    # Rule for future changes: if you need stats data on the main thread,
-    # read self._stats_cache — never call self.cache.stats() inline.
-    #
-    # Use post_message rather than call_from_thread for all background→UI
-    # communication.  post_message is thread-safe via call_soon_threadsafe and
-    # is fire-and-forget — the background thread never blocks waiting for the
-    # main thread to process the result.  call_from_thread blocks the caller.
+    # ── Pipeline log callback ─────────────────────────────────────────────────
 
-    def _schedule_stats_refresh(self) -> None:
-        """Launch a background fetch of cache.stats() if one isn't already running.
+    def _on_pipeline_log(self, source: str, msg: str) -> None:
+        """Receive a log message from the Pipeline and post it to the TUI.
 
-        Uses a plain boolean flag rather than Textual's exclusive=True so that
-        an in-progress fetch is never cancelled mid-query.  exclusive=True
-        would kill the previous asyncio task on every 1 s tick; because thread
-        workers run via run_in_executor the cancellation only discards the
-        result — the OS thread keeps running and holds the SQLite lock until
-        the query finishes.  If the lock is stalled by a WAL checkpoint (which
-        can take 2–3 s), the stats query exceeds the 1 s interval and every
-        tick perpetually cancels the prior result, so StatsUpdate is never
-        posted and the display freezes permanently.
-
-        The flag approach lets the slow query finish and deliver its result
-        even when it spans multiple timer ticks.
+        Called from background stage threads — must be thread-safe.
+        post_message uses call_soon_threadsafe internally and is non-blocking.
         """
-        if self._quitting:
-            return
-        # Skip — a fetch is already in flight; let it finish undisturbed.
-        if self._stats_refresh_running:
-            return
-        self._stats_refresh_running = True
-
-        def _fetch() -> None:
-            try:
-                result = self.cache.stats(enabled_tags=self._enabled_tags)
-                # post_message is thread-safe and non-blocking; the background
-                # thread does not wait for the main thread to process the update.
-                self.post_message(StatsUpdate(result))
-            except Exception as exc:
-                # Non-fatal: the stale cache value stays in place until the
-                # next successful fetch.
-                logger.warning("Stats refresh error (non-fatal): {}", exc)
-            finally:
-                # Always clear the flag so the next timer tick can launch a
-                # fresh fetch, even if stats() raised an exception.
-                self._stats_refresh_running = False
-
-        self.run_worker(
-            _fetch,
-            thread=True,
-            group="stats_refresh",
-            exclusive=False,
-            exit_on_error=False,
-        )
-
-    def on_stats_update(self, event: StatsUpdate) -> None:
-        """Apply a freshly fetched stats snapshot. Always called on the main thread."""
-        self._stats_cache = event.stats
-        self._stats_last_updated = time.monotonic()
+        try:
+            self.post_message(LogEvent(source, msg))
+        except RuntimeError:
+            pass  # App has already stopped; discard the message
 
     def _schedule_storage_refresh(self, total: int) -> None:
         """Launch a background fetch of storage/embeddings stats."""
@@ -841,34 +716,19 @@ class MusicTaggerApp(App):
                 )
 
     def _refresh_panels_inner(self) -> None:
-        # Read from the cached stats dict — never call cache.stats() here.
-        # The background stats-refresh worker (_schedule_stats_refresh) keeps
-        # this up to date at ~1 s intervals without touching the main thread.
-        stats = self._stats_cache
+        # pipeline.stats calls cache.stats() directly — always fresh, no delay.
+        stats = self.pipeline.stats
         self._spin_frame += 1
 
         # Stats bar — only re-render when the content actually changes.
         paused_tag = "  [yellow]⏸ PAUSED[/yellow]" if self.paused else ""
-        # Warn if the background stats refresh hasn't delivered an update in
-        # over 15 seconds.  This makes a frozen display self-diagnosing: the
-        # user can see the warning rather than silently watching stale numbers.
-        # _stats_last_updated is 0.0 on first mount so we skip the warning
-        # until at least one successful fetch has been delivered.
-        stats_age = time.monotonic() - self._stats_last_updated
-        stale_tag = (
-            "  [red bold]⚠ STATS STALE[/red bold]"
-            if self._stats_last_updated > 0.0 and stats_age > 15.0
-            else ""
-        )
         stats_bar_text = (
             f"[dim]Library[/dim] [cyan]{self.config.music_path}[/cyan]"
             f"   [dim]Total[/dim] [green]{stats['total']:,}[/green]"
             f"   [dim]Needs inspection[/dim] [yellow]{stats['needs_inspection']:,}[/yellow]"
             f"   [dim]Needs work[/dim] [red]{stats['needs_work']:,}[/red]"
             f"   [dim]Done[/dim] {stats['done']:,}"
-            f"   [dim]Errors[/dim] [red]{stats['errors']:,}[/red]"
-            + paused_tag
-            + stale_tag
+            f"   [dim]Errors[/dim] [red]{stats['errors']:,}[/red]" + paused_tag
         )
         if stats_bar_text != self._stats_bar_text:
             self._stats_bar_text = stats_bar_text
@@ -878,8 +738,8 @@ class MusicTaggerApp(App):
         self.query_one("#panel-scanner", StatusPanel).set_rows(
             {
                 "Status": _status_glyph(self.scanner.running, self._spin_frame),
-                "Last run": _fmt_ago(self._last_scan),
-                "Next run": _fmt_next_run(self._next_scan),
+                "Last run": _fmt_ago(self.pipeline.last_scan),
+                "Next run": _fmt_next_run(self.pipeline.next_scan),
                 "Schedule": self.config.scan_cron,
                 "File throttle": f"{self.config.file_throttle_ms} ms",
                 "Dir throttle": f"{self.config.dir_throttle_ms} ms",
@@ -924,12 +784,11 @@ class MusicTaggerApp(App):
 
         cleanup_rate = self.cleanup.pass_rate
         cleanup_remaining = self.cleanup.pass_total - self.cleanup.pass_checked
-        cleanup_next_str = _fmt_next_run(self._next_cleanup)
         self.query_one("#panel-cleanup", StatusPanel).set_rows(
             {
                 "Status": _status_glyph(self.cleanup.running, self._spin_frame),
-                "Last run": _fmt_ago(self._last_cleanup),
-                "Next run": cleanup_next_str,
+                "Last run": _fmt_ago(self.pipeline.last_cleanup),
+                "Next run": _fmt_next_run(self.pipeline.next_cleanup),
                 "Schedule": self.config.cleanup_cron,
                 "Last removed": str(self.cleanup.last_removed),
                 "Rate": _fmt_rate(cleanup_rate),
@@ -949,8 +808,9 @@ class MusicTaggerApp(App):
             overview_pane = self.query_one("#overview-pane")
             if overview_pane.display:
                 self.query_one("#library-overview", LibraryOverview).update_stats(stats)
+                enabled_tags = [t for t in TAGS if self.config.tag_cfg(t.name).enabled]
                 self.query_one("#tag-coverage", TagCoveragePanel).update_stats(
-                    stats, self._enabled_tags, total
+                    stats, enabled_tags, total
                 )
         except Exception:
             pass  # Widget not mounted yet — will catch up on the next tick
@@ -962,185 +822,6 @@ class MusicTaggerApp(App):
         if self._overview_tick % 10 == 1:
             self._schedule_storage_refresh(total)
 
-    # ── Orchestration ──────────────────────────────────────────────────────────
-
-    def _orchestrate(self) -> None:
-        """Called every 5 s — starts jobs according to schedule."""
-        # Guard: any unhandled exception here propagates to the Textual event
-        # loop and triggers app.panic() → process exit.  Swallow and log instead.
-        try:
-            self._orchestrate_inner()
-        except Exception as exc:
-            logger.warning("Orchestrate error (non-fatal): {}", exc)
-
-    def _orchestrate_inner(self) -> None:
-        if self.paused:
-            return
-
-        now = time.time()
-
-        # Scanner watchdog — mirrors the worker watchdog.  The scanner updates
-        # last_activity on every file and every directory listing.  If no
-        # heartbeat is seen for _SCANNER_HANG_TIMEOUT_S the scan thread is
-        # stuck inside os.scandir() (NFS stall that even the per-directory
-        # timeout thread couldn't unblock in time).  Force-clear the running
-        # flag so the orchestrator relaunches on the next tick.
-        if self.scanner.running:
-            idle_s = time.monotonic() - self.scanner.last_activity
-            if idle_s > _SCANNER_HANG_TIMEOUT_S:
-                self._applog_markup(
-                    f"[red]Scanner watchdog: no heartbeat for {int(idle_s)}s — "
-                    f"resetting running flag and relaunching[/red]"
-                )
-                logger.warning(
-                    "Scanner watchdog: no heartbeat for {}s — force-resetting running flag",
-                    int(idle_s),
-                )
-                self.scanner.stop()
-
-        # Scanner — run on schedule.
-        # _next_scan may be inf after a manual run (action_force_scan sets it
-        # to inf to prevent an immediate re-trigger).  Once the job finishes
-        # we compute the real next cron tick here.
-        if self._next_scan == float("inf") and not self.scanner.running:
-            self._next_scan = _cron_next(self.config.scan_cron)
-
-        if now >= self._next_scan and not self.scanner.running:
-            self._last_scan = now
-            self._next_scan = _cron_next(self.config.scan_cron)
-            self.scanner.reset()
-            self.run_worker(
-                self.scanner.run_pass,
-                thread=True,
-                group="scanner",
-                exclusive=True,
-                exit_on_error=False,
-            )
-
-        # Inspector — run continuously while there's a queue.
-        # inspector.run() loops run_pass() internally until the queue drains,
-        # so a full batch immediately triggers the next pass without waiting
-        # for the next 5 s orchestrator tick.
-        if not self.inspector.running:
-            if self._stats_cache["needs_inspection"] > 0:
-                self.inspector.reset()
-                self.run_worker(
-                    self.inspector.run,
-                    thread=True,
-                    group="inspector",
-                    exclusive=True,
-                    exit_on_error=False,
-                )
-
-        # Worker — run continuously while there's a queue.
-        # Watchdog: if the worker claims to be running but its last heartbeat is
-        # older than the hang timeout, the thread is stuck (NFS stall, hung
-        # TensorFlow graph, etc.).  Force-clear the running flag so the
-        # orchestrator can launch a fresh pass on the next tick.  The stuck
-        # thread will eventually be killed by Textual when the exclusive group
-        # launches a new worker.
-        if self.worker.running:
-            idle_s = time.monotonic() - self.worker.last_activity
-            if idle_s > _WORKER_HANG_TIMEOUT_S:
-                self._applog_markup(
-                    f"[red]Worker watchdog: no heartbeat for {int(idle_s)}s — "
-                    f"resetting running flag and relaunching[/red]"
-                )
-                logger.warning(
-                    "Worker watchdog: no heartbeat for {}s — force-resetting running flag",
-                    int(idle_s),
-                )
-                self.worker.stop()
-
-                # Recover any 'working' row the hung pass left behind — done
-                # in a background thread so the DB write + commit don't block
-                # the orchestrator's event-loop callback.
-                def _recover() -> None:
-                    try:
-                        recovered = self.cache.requeue_working()
-                        if recovered:
-                            self.cache.flush()
-                            logger.warning(
-                                "Worker watchdog: requeued {} stuck 'working' row(s)",
-                                recovered,
-                            )
-                    except Exception as exc:
-                        logger.warning("Worker watchdog recovery failed: {}", exc)
-
-                self.run_worker(
-                    _recover, thread=True, group="watchdog_recover", exit_on_error=False
-                )
-
-        if not self.worker.running:
-            # Recover any rows left in 'working' status from a previous pass
-            # that exited without committing (e.g. worker thread exception, OS
-            # signal mid-batch, or a watchdog reset).  requeue_working() only
-            # touches 'working' rows, so it is safe to call even when no rows
-            # are stuck — the UPDATE is a no-op.  Run in a background thread to
-            # keep the event-loop callback free of blocking DB I/O.
-            # Only do this when the worker is truly idle (not running) so we
-            # don't race with a batch that's still in flight.
-            if self._stats_cache.get("in_progress", 0) > 0 and not self._quitting:
-
-                def _requeue_stuck() -> None:
-                    try:
-                        recovered = self.cache.requeue_working()
-                        if recovered:
-                            self.cache.flush()
-                            logger.warning(
-                                "Orchestrator: requeued {} stuck 'working' row(s) "
-                                "left by a previous pass",
-                                recovered,
-                            )
-                    except Exception as exc:
-                        # Non-fatal: rows remain in 'working' status and will
-                        # be recovered again on the next orchestrator tick or
-                        # at next startup.
-                        logger.warning("Stuck-working recovery failed: {}", exc)
-
-                self.run_worker(
-                    _requeue_stuck,
-                    thread=True,
-                    group="requeue_stuck",
-                    exclusive=True,
-                    exit_on_error=False,
-                )
-
-            if self._stats_cache["needs_work"] > 0 and not self._quitting:
-                # reset() clears the stop event so run() can enter its loop.
-                # Only do this when not quitting — during shutdown the event
-                # must stay set so run_pass() refuses to re-enter.
-                self.worker.reset()
-                self.run_worker(
-                    lambda: self.worker.run(self.config.worker_batch_size),
-                    thread=True,
-                    group="worker",
-                    exclusive=True,
-                    exit_on_error=False,
-                )
-
-        # Cleanup — run on schedule.
-        # _next_cleanup may be inf after a manual run (action_run_cleanup sets
-        # it to inf to prevent an immediate re-trigger).  Once the job finishes
-        # we compute the real next cron tick here.
-        if self._next_cleanup == float("inf") and not self.cleanup.running:
-            self._next_cleanup = _cron_next(self.config.cleanup_cron)
-
-        # Cleanup only stat()s files and removes orphan DB rows; it is safe to
-        # run alongside the scanner and inspector, which use the same
-        # lock-protected SQLite connection.  No idle-pipeline gate is needed.
-        if now >= self._next_cleanup and not self.cleanup.running:
-            self._last_cleanup = now
-            self._next_cleanup = _cron_next(self.config.cleanup_cron)
-            self.cleanup.reset()
-            self.run_worker(
-                self.cleanup.run,
-                thread=True,
-                group="cleanup",
-                exclusive=True,
-                exit_on_error=False,
-            )
-
     # ── Actions ────────────────────────────────────────────────────────────────
 
     def action_force_scan(self) -> None:
@@ -1148,58 +829,26 @@ class MusicTaggerApp(App):
             self._applog("Scanner already running")
             return
         self._applog("Forcing scan…")
-        self._last_scan = time.time()
-        # Push _next_scan far into the future so the orchestrator does not
-        # immediately re-trigger once the job finishes.  The orchestrator will
-        # compute the real next cron tick once this run completes.
-        self._next_scan = float("inf")
-        self.scanner.reset()
-        self.run_worker(
-            self.scanner.run_pass,
-            thread=True,
-            group="scanner",
-            exclusive=True,
-            exit_on_error=False,
-        )
+        self.pipeline.force_scan()
 
     def action_force_inspect(self) -> None:
         if self.inspector.running:
             self._applog("Inspector already running")
             return
         self._applog("Forcing inspection pass…")
-        self.inspector.reset()
-        self.run_worker(
-            self.inspector.run,
-            thread=True,
-            group="inspector",
-            exclusive=True,
-            exit_on_error=False,
-        )
+        self.pipeline.force_inspect()
 
     def action_run_cleanup(self) -> None:
         if self.cleanup.running:
             self._applog("Cleanup already running")
             return
         self._applog("Running cleanup…")
-        self._last_cleanup = time.time()
-        # Push _next_cleanup far into the future so the orchestrator does not
-        # immediately re-trigger once the job finishes.  The orchestrator will
-        # compute the real next cron tick once this run completes.
-        self._next_cleanup = float("inf")
-        self.cleanup.reset()
-        self.run_worker(
-            self.cleanup.run,
-            thread=True,
-            group="cleanup",
-            exclusive=True,
-            exit_on_error=False,
-        )
+        self.pipeline.force_cleanup()
 
     def action_requeue_errors(self) -> None:
         def _requeue() -> None:
             try:
-                count = self.cache.requeue_errors()
-                self.cache.flush()
+                count = self.pipeline.requeue_errors()
                 if count:
                     self.post_message(
                         LogEvent(
@@ -1258,12 +907,10 @@ class MusicTaggerApp(App):
             self._applog_markup(
                 "[yellow]⏸  Paused — jobs will finish their current pass then stop[/yellow]"
             )
-            self.scanner.stop()
-            self.inspector.stop()
-            self.worker.stop()
-            self.cleanup.stop()
+            self.pipeline.pause()
         else:
             self._applog_markup("[green]▶  Resumed[/green]")
+            self.pipeline.resume()
 
     # ── Graceful quit ──────────────────────────────────────────────────────────
 
@@ -1280,17 +927,15 @@ class MusicTaggerApp(App):
         self._quitting = True
         self._quit_time = time.monotonic()
 
-        # Signal every pipeline stage to stop at the next iteration boundary.
-        self.scanner.stop()
-        self.inspector.stop()
-        self.worker.stop()
-        self.cleanup.stop()
+        # Signal the pipeline and all stages to stop.
+        self.pipeline.stop()
 
         any_running = (
             self.scanner.running
             or self.inspector.running
             or self.worker.running
             or self.cleanup.running
+            or self.pipeline.running
         )
 
         if not any_running:
@@ -1319,7 +964,8 @@ class MusicTaggerApp(App):
         long-running inference pass (BPM, Essentia) to finish on its own.
         """
         all_stopped = (
-            not self.scanner.running
+            not self.pipeline.running
+            and not self.scanner.running
             and not self.inspector.running
             and not self.worker.running
             and not self.cleanup.running
@@ -1336,7 +982,7 @@ class MusicTaggerApp(App):
                 self._QUIT_TIMEOUT_S,
             )
 
-        self.worker.close()
+        self.pipeline.close()
         self.exit()
 
     # ── Worker error handling ──────────────────────────────────────────────────
@@ -1516,62 +1162,16 @@ class MusicTaggerApp(App):
             if source in self._active_sources:
                 log.write(line)
 
-    def _make_log(self, source: str) -> Callable[[str], None]:
-        """Returns a log function safe to call from a background thread.
-
-        Uses ``post_message`` directly rather than ``call_from_thread`` because
-        ``post_message`` is already thread-safe (it uses ``call_soon_threadsafe``
-        internally) and is non-blocking — the background thread does not wait for
-        the main thread to process the message.  ``call_from_thread`` wraps the
-        call in a coroutine and blocks the caller until the event loop runs it,
-        adding unnecessary latency on both sides.
-        """
-
-        def log_fn(msg: str) -> None:
-            try:
-                self.post_message(LogEvent(source, msg))
-            except RuntimeError:
-                pass  # App has already stopped; discard the log message
-
-        return log_fn
-
-    def _make_log_markup(self, source: str) -> Callable[[str], None]:
-        """Returns a markup log function safe to call from a background thread.
-
-        The message is treated as pre-trusted Rich markup and rendered without
-        escaping.  Use only for strings built from safe, controlled content.
-
-        See ``_make_log`` for why ``post_message`` is used instead of
-        ``call_from_thread``.
-        """
-
-        def log_fn(msg: str) -> None:
-            try:
-                self.post_message(LogEvent(source, msg, markup=True))
-            except RuntimeError:
-                pass  # App has already stopped; discard the log message
-
-        return log_fn
-
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def on_unmount(self) -> None:
-        self.scanner.stop()
-        self.inspector.stop()
-        self.worker.stop()
-        self.cleanup.stop()
-        # Cancel any in-flight Textual background workers that periodically
-        # query the cache (stats and storage refresh).  Thread workers cannot
-        # be pre-empted, but cancelling them marks them as done so Textual
-        # stops scheduling new ones.  The _closed guard on FileCache ensures
-        # that any already-running thread that reaches a DB call after this
-        # point silently returns instead of raising.
+        self.pipeline.stop()
+        # Cancel any in-flight Textual background workers (storage refresh).
         try:
-            self.workers.cancel_group(self, "stats_refresh")
             self.workers.cancel_group(self, "storage_refresh")
         except Exception:
             pass  # App already torn down — ignore
-        self.cache.close()
+        self.pipeline.close()
         self._emb_cache.close()
 
 
