@@ -19,9 +19,9 @@ used:
     warning, skips that directory, and moves on.  The stuck thread is
     abandoned (it is daemon, so it won't prevent process exit).
 
-  Heartbeat + watchdog (TUI side)
+  Heartbeat + watchdog (Pipeline side)
     ``last_activity`` is updated on every file and every successful
-    directory entry.  The TUI orchestrator polls this timestamp and
+    directory entry.  The Pipeline orchestrator polls this timestamp and
     force-resets ``_running`` if no heartbeat is seen for
     ``_SCANNER_HANG_TIMEOUT_S`` seconds, then relaunches a fresh pass on
     the next tick.
@@ -101,7 +101,7 @@ class Scanner:
       - Can be stopped mid-pass cleanly
 
     ``last_activity`` is a ``time.monotonic()`` timestamp updated on every
-    processed file and every successfully listed directory.  The TUI
+    processed file and every successfully listed directory.  The Pipeline
     watchdog uses this to detect a frozen scan thread and force-reset it.
     """
 

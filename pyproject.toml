@@ -1,7 +1,7 @@
 [project]
 name = "musictagger"
 version = "0.1.0"
-description = "Add your description here"
+description = "Terminal UI that scans a music library and fills missing analysis tags (BPM, mood, key, and more) using DeepRhythm and Essentia."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

@@ -616,6 +616,14 @@ class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
     each worker thread.  Daemon threads do not prevent process exit — if the
     app closes while an ffmpeg decode is in flight the OS reclaims the child
     process naturally.
+
+    WARNING: ``_adjust_thread_count`` accesses private CPython internals from
+    ``concurrent.futures.thread`` (``_worker``, ``_threads_queues``, and
+    several ``_`` attributes on the executor itself).  These are implementation
+    details that could change in a future CPython patch release.  If this class
+    breaks after a Python upgrade, the fix is either to vendor the full
+    ``_adjust_thread_count`` body from the new CPython source or to switch to
+    a subprocess-based approach for ffmpeg decoding.
     """
 
     def _adjust_thread_count(self) -> None:
@@ -1366,9 +1374,9 @@ class Worker:
         # branch on whether markup is available.
         self._log_markup = markup_log_fn or self._log
         self._running = False
-        # Stop signal — set by stop(), cleared by reset().  Replaces the old
-        # _stop_requested bool: threading.Event is the standard Python idiom
-        # for cross-thread stop signalling and makes the semantics explicit.
+        # Stop signal — set by stop(), cleared by reset() before each new run.
+        # Checked at the top of run_pass() so a stop() call between passes is
+        # caught before any new DB work begins.
         self._stop_event = threading.Event()
         self._processed = 0
         self._errors = 0

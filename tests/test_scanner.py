@@ -177,10 +177,10 @@ def test_scanner_stop_clears_running_flag() -> None:
 def test_scanner_watchdog_calls_stop_when_heartbeat_stale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Simulate the TUI watchdog logic: if last_activity is old, call stop().
+    """Simulate the Pipeline watchdog: if last_activity is stale, call stop().
 
-    This test replicates the _orchestrate_inner watchdog check in isolation
-    so we verify the decision boundary without needing a running Textual app.
+    Replicates Pipeline._check_watchdogs() in isolation to verify the
+    decision boundary without needing a running Pipeline or Textual app.
     """
     cache = FileCache(tmp_path / "cache.db")
     try:
@@ -191,9 +191,9 @@ def test_scanner_watchdog_calls_stop_when_heartbeat_stale(
         scanner._running = True
         scanner.last_activity = time.monotonic() - 9999  # far in the past
 
-        _SCANNER_HANG_TIMEOUT_S = 120  # same constant as tui.py
+        _SCANNER_HANG_TIMEOUT_S = 120  # same constant as pipeline.py
 
-        # Replicate the watchdog decision from _orchestrate_inner.
+        # Replicate the watchdog decision from Pipeline._check_watchdogs().
         idle_s = time.monotonic() - scanner.last_activity
         if scanner.running and idle_s > _SCANNER_HANG_TIMEOUT_S:
             scanner.stop()
