@@ -1178,12 +1178,15 @@ class MusicTaggerApp(App):
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def on_unmount(self) -> None:
+        # Stop all stages — covers the Ctrl+C / unexpected-exit path where
+        # action_quit / _poll_quit never ran.  safe to call even if already stopped.
         self.pipeline.stop()
         # Cancel any in-flight Textual background workers (storage refresh).
         try:
             self.workers.cancel_group(self, "storage_refresh")
         except Exception:
             pass  # App already torn down — ignore
+        # pipeline.close() is idempotent — safe even if _poll_quit already called it.
         self.pipeline.close()
         self._emb_cache.close()
 

@@ -167,6 +167,7 @@ class EmbeddingCache:
         self._ensure_encoding_column()
         self._conn.commit()
         self._lock = threading.Lock()
+        self._closed = False
         logger.debug("EmbeddingCache opened: {}", db_path)
 
     # ── Internal helpers ────────────────────────────────────────────────────────
@@ -379,11 +380,16 @@ class EmbeddingCache:
     def flush(self) -> None:
         """Commit pending writes to disk."""
         with self._lock:
+            if self._closed:
+                return
             self._conn.commit()
 
     def close(self) -> None:
-        """Flush and close the database connection."""
+        """Flush and close the database connection.  Safe to call multiple times."""
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.commit()
             self._conn.close()
 

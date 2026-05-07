@@ -308,6 +308,21 @@ def test_pipeline_on_log_and_on_log_markup_are_independent(tmp_path: Path) -> No
 # ── start / join / running ────────────────────────────────────────────────────
 
 
+def test_pipeline_close_is_idempotent(tmp_path: Path) -> None:
+    """pipeline.close() called twice must not raise.
+
+    Regression: the TUI calls close() from _poll_quit (clean quit path) and
+    again from on_unmount (always runs on shutdown).  The second call must be
+    a no-op rather than hitting an already-closed SQLite connection.
+    """
+    from musictagger.pipeline import Pipeline
+
+    config = _make_config(tmp_path)
+    pipeline = Pipeline(config)
+    pipeline.close()
+    pipeline.close()  # must not raise
+
+
 def test_pipeline_running_is_false_before_start(tmp_path: Path) -> None:
     """Pipeline.running is False until start() is called."""
     from musictagger.pipeline import Pipeline

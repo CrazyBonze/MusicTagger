@@ -328,7 +328,12 @@ def _run() -> None:
     Tests call main() directly and do not go through _run(), so they are
     unaffected by the forced exit.
     """
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C while the TUI is running — Textual has already called
+        # on_unmount and cleaned up.  Fall through to os._exit() below.
+        pass
     os._exit(0)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -392,3 +393,19 @@ def test_file_cache_fingerprint_hash_missing_returns_none(tmp_path) -> None:
         assert cache.get_fingerprint_hash("/nonexistent/file.mp3") is None
     finally:
         cache.close()
+
+
+# ── EmbeddingCache.close() idempotency ────────────────────────────────────────
+
+
+def test_embedding_cache_close_is_idempotent(tmp_path: Path) -> None:
+    """Calling close() twice must not raise ProgrammingError.
+
+    Regression test: the TUI can call pipeline.close() from both _poll_quit
+    and on_unmount.  Without an _closed guard, the second call reaches
+    EmbeddingCache.close() with an already-closed sqlite3 connection and
+    raises 'Cannot operate on a closed database'.
+    """
+    cache = EmbeddingCache(tmp_path / "embeddings.db")
+    cache.close()
+    cache.close()  # must not raise

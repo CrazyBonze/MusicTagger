@@ -135,6 +135,9 @@ class Pipeline:
         self._stage_threads: dict[str, threading.Thread] = {}
         self._stage_lock = threading.Lock()
 
+        # Guard against double-close (e.g. _poll_quit + on_unmount both calling close()).
+        self._closed = False
+
     # ── Public properties ─────────────────────────────────────────────────────
 
     @property
@@ -232,7 +235,11 @@ class Pipeline:
         """Release database connections and worker resources.
 
         Always call this when the pipeline is permanently shut down.
+        Safe to call multiple times — subsequent calls are no-ops.
         """
+        if self._closed:
+            return
+        self._closed = True
         self.worker.close()
         self.cache.close()
 
