@@ -8,6 +8,7 @@ state on each 0.5 s panel-refresh tick.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -585,6 +586,21 @@ class MusicTaggerApp(App):
         # Monotonic timestamp of the last _refresh_panels_inner exception, used
         # to rate-limit TUI activity-log noise to at most once per minute.
         self._panels_error_last_logged: float = 0.0
+        # Cached stats dict — updated by a background daemon thread so that
+        # _refresh_panels_inner never calls cache.stats() on the event loop
+        # (cache.stats() takes ~80ms and would block the asyncio event loop,
+        # causing Textual to hang during shutdown while waiting for in-flight
+        # event-loop callbacks to complete).
+        self._stats_cache: dict = {
+            "total": 0,
+            "needs_inspection": 0,
+            "needs_work": 0,
+            "errors": 0,
+            "done": 0,
+            "per_tag": {t.name: 0 for t in TAGS},
+        }
+        # Event to stop the stats refresh thread cleanly on shutdown.
+        self._stats_stop = threading.Event()
 
     # ── Layout ─────────────────────────────────────────────────────────────────
 
@@ -630,10 +646,34 @@ class MusicTaggerApp(App):
         # Start the pipeline orchestration thread.
         self.pipeline.start()
 
-        # Panel refresh at 0.5 s — reads pipeline.stats and stage state directly.
-        # No separate background stats-refresh worker or stale-cache indirection.
+        # Background stats refresh — updates _stats_cache every ~1 s on a plain
+        # daemon thread so that _refresh_panels_inner never blocks the asyncio
+        # event loop with an 80ms cache.stats() call.
+        self._start_stats_thread()
+
+        # Panel refresh at 0.5 s — reads from _stats_cache (always fast).
         self.set_interval(0.5, self._refresh_panels)
         self._refresh_panels()
+
+    # ── Background stats refresh ──────────────────────────────────────────────
+
+    def _start_stats_thread(self) -> None:
+        """Start a daemon thread that refreshes _stats_cache every ~1 second.
+
+        Using a plain daemon thread (not Textual run_worker) keeps this entirely
+        outside Textual's worker machinery, so it never blocks Textual's shutdown
+        sequence while awaiting task completion.
+        """
+        def _loop() -> None:
+            while not self._stats_stop.is_set():
+                try:
+                    self._stats_cache = self.pipeline.stats
+                except Exception:
+                    pass  # stale cache stays in place until next successful fetch
+                self._stats_stop.wait(timeout=1.0)
+
+        t = threading.Thread(target=_loop, name="tui-stats-refresh", daemon=True)
+        t.start()
 
     # ── Pipeline log callback ─────────────────────────────────────────────────
 
@@ -661,9 +701,17 @@ class MusicTaggerApp(App):
             pass  # App has already stopped; discard the message
 
     def _schedule_storage_refresh(self, total: int) -> None:
-        """Launch a background fetch of storage/embeddings stats."""
+        """Launch a background fetch of storage/embeddings stats.
+
+        Uses a plain daemon thread rather than Textual's run_worker so that
+        Textual's shutdown sequence never blocks waiting for this worker's
+        asyncio task to complete.
+        """
         if self._quitting:
             return
+        if getattr(self, "_storage_refresh_running", False):
+            return  # a fetch is already in flight
+        self._storage_refresh_running = True
 
         def _fetch() -> None:
             try:
@@ -673,27 +721,26 @@ class MusicTaggerApp(App):
                 emb_stats = self._emb_cache.stats()
                 fingerprinted = self.cache.fingerprinted_count()
                 error_summary = self.cache.error_summary()
-                self.post_message(
-                    StoragePanelUpdate(
-                        library_bytes,
-                        cache_db_bytes,
-                        embeddings_db_bytes,
-                        emb_stats,
-                        fingerprinted,
-                        total,
-                        error_summary,
+                try:
+                    self.post_message(
+                        StoragePanelUpdate(
+                            library_bytes,
+                            cache_db_bytes,
+                            embeddings_db_bytes,
+                            emb_stats,
+                            fingerprinted,
+                            total,
+                            error_summary,
+                        )
                     )
-                )
+                except RuntimeError:
+                    pass  # App already stopped
             except Exception as exc:
                 logger.warning("Storage panel refresh error (non-fatal): {}", exc)
+            finally:
+                self._storage_refresh_running = False
 
-        self.run_worker(
-            _fetch,
-            thread=True,
-            group="storage_refresh",
-            exclusive=True,
-            exit_on_error=False,
-        )
+        threading.Thread(target=_fetch, name="tui-storage-refresh", daemon=True).start()
 
     def on_storage_panel_update(self, event: StoragePanelUpdate) -> None:
         """Apply a freshly fetched storage snapshot. Always called on the main thread."""
@@ -729,8 +776,10 @@ class MusicTaggerApp(App):
                 )
 
     def _refresh_panels_inner(self) -> None:
-        # pipeline.stats calls cache.stats() directly — always fresh, no delay.
-        stats = self.pipeline.stats
+        # Read from the cached stats dict — never calls cache.stats() here.
+        # The background stats thread (_start_stats_thread) keeps this updated
+        # every ~1 s without touching the asyncio event loop.
+        stats = self._stats_cache
         self._spin_frame += 1
 
         # Stats bar — only re-render when the content actually changes.
@@ -863,22 +912,26 @@ class MusicTaggerApp(App):
             try:
                 count = self.pipeline.requeue_errors()
                 if count:
-                    self.post_message(
-                        LogEvent(
-                            "app",
-                            f"Requeued {count} error(s) — worker will retry on next pass",
+                    try:
+                        self.post_message(
+                            LogEvent(
+                                "app",
+                                f"Requeued {count} error(s) — worker will retry on next pass",
+                            )
                         )
-                    )
+                    except RuntimeError:
+                        pass
                 else:
-                    self.post_message(
-                        LogEvent("app", "No error rows with missing tags to requeue")
-                    )
+                    try:
+                        self.post_message(
+                            LogEvent("app", "No error rows with missing tags to requeue")
+                        )
+                    except RuntimeError:
+                        pass
             except Exception as exc:
                 logger.warning("requeue_errors failed: {}", exc)
 
-        self.run_worker(
-            _requeue, thread=True, group="requeue_errors", exit_on_error=False
-        )
+        threading.Thread(target=_requeue, name="tui-requeue-errors", daemon=True).start()
 
     def action_cycle_view(self) -> None:
         """Toggle between the activity log and the library overview."""
@@ -996,7 +1049,14 @@ class MusicTaggerApp(App):
             )
 
         self.pipeline.close()
-        self.exit()
+        # Use os._exit() directly rather than self.exit() to bypass Textual's
+        # async shutdown sequence, which hangs indefinitely waiting on internal
+        # widget message pumps to drain.  All application-level cleanup
+        # (SQLite commit+close) is already done by pipeline.close() above.
+        # The _emb_cache read-only connection needs no explicit close —
+        # WAL mode guarantees integrity on abrupt exit.
+        import os as _os
+        _os._exit(0)
 
     # ── Worker error handling ──────────────────────────────────────────────────
 
@@ -1178,17 +1238,17 @@ class MusicTaggerApp(App):
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def on_unmount(self) -> None:
-        # Stop all stages — covers the Ctrl+C / unexpected-exit path where
-        # action_quit / _poll_quit never ran.  safe to call even if already stopped.
+        # Signal all stages to stop and stop the stats refresh thread.
+        # This covers the Ctrl+C / unexpected-exit path where action_quit /
+        # _poll_quit never ran.
+        #
+        # We deliberately do NOT block here (no pipeline.close(), no
+        # _emb_cache.close()) because on_unmount runs on the asyncio event loop.
+        # Any blocking call here stalls Textual's entire shutdown sequence.
+        # Resource cleanup happens in _poll_quit (clean quit) and os._exit(0)
+        # in _run() (all other paths).
+        self._stats_stop.set()
         self.pipeline.stop()
-        # Cancel any in-flight Textual background workers (storage refresh).
-        try:
-            self.workers.cancel_group(self, "storage_refresh")
-        except Exception:
-            pass  # App already torn down — ignore
-        # pipeline.close() is idempotent — safe even if _poll_quit already called it.
-        self.pipeline.close()
-        self._emb_cache.close()
 
 
 # ── Formatting helpers ─────────────────────────────────────────────────────────
