@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
+import threading
 from pathlib import Path
 
 from musictagger.cache import FileCache
@@ -213,6 +215,14 @@ def main() -> None:
         action="store_true",
         help="Print resolved config and storage paths, then exit.",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "Run the pipeline without a TUI.  All output goes to the log file "
+            "and stderr.  Send SIGINT (Ctrl-C) or SIGTERM to stop cleanly."
+        ),
+    )
     args = parser.parse_args()
 
     config = Config.load(
@@ -243,16 +253,62 @@ def main() -> None:
     setup_logging(config)
     _recover_interrupted_rows(config)
     _ensure_models_available(config, policy)
-    app = MusicTaggerApp(config)
-    try:
-        app.run()
-    finally:
-        # Flush the loguru enqueue buffer before exit.  enqueue=True writes
-        # log records via a background thread; without this the thread can be
-        # killed by interpreter shutdown before the last records reach disk.
-        from loguru import logger
 
-        logger.complete()
+    if args.headless:
+        _run_headless(config)
+    else:
+        app = MusicTaggerApp(config)
+        try:
+            app.run()
+        finally:
+            # Flush the loguru enqueue buffer before exit.  enqueue=True writes
+            # log records via a background thread; without this the thread can be
+            # killed by interpreter shutdown before the last records reach disk.
+            from loguru import logger
+
+            logger.complete()
+
+
+def _run_headless(config: Config) -> None:
+    """Run the full pipeline without a TUI.
+
+    Starts the Pipeline, installs SIGINT/SIGTERM handlers for clean shutdown,
+    then blocks until a stop signal is received or the pipeline exits on its
+    own.  All observability comes from the loguru log file and stderr.
+    """
+    from loguru import logger
+    from musictagger.pipeline import Pipeline
+
+    pipeline = Pipeline(config)
+
+    stop_requested = threading.Event()
+
+    def _handle_signal(signum: int, frame: object) -> None:
+        logger.info("Signal {} received — stopping pipeline", signum)
+        stop_requested.set()
+        pipeline.stop()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    logger.info(
+        "musictagger headless mode started — library={}, db={}",
+        config.music_path,
+        config.db_path,
+    )
+
+    pipeline.start()
+
+    # Block the main thread until a signal fires or the pipeline stops itself.
+    while pipeline.running and not stop_requested.is_set():
+        stop_requested.wait(timeout=1.0)
+
+    pipeline.stop()
+    pipeline.join(timeout=15.0)
+    pipeline.close()
+
+    logger.info("musictagger headless mode stopped")
+    logger.complete()
 
 
 def _run() -> None:

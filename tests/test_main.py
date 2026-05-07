@@ -319,3 +319,49 @@ def test_main_calls_recover_interrupted_rows_before_app_launch(
 
     # recover must happen before the app launches.
     assert call_order == ["recover", "app"]
+
+
+# ── Headless mode ─────────────────────────────────────────────────────────────
+
+
+def test_headless_flag_runs_pipeline_without_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--headless must start the Pipeline and exit cleanly without the TUI."""
+    import threading
+    import musictagger.__main__ as main_module
+
+    started = threading.Event()
+    stopped = threading.Event()
+
+    class _FakePipeline:
+        def __init__(self, config: object) -> None:
+            self._stop_event = threading.Event()
+
+        def start(self) -> None:
+            started.set()
+
+        def stop(self) -> None:
+            self._stop_event.set()
+            stopped.set()
+
+        def join(self, timeout: float = 10.0) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        @property
+        def running(self) -> bool:
+            # Return False immediately so the wait loop exits.
+            return False
+
+    monkeypatch.setattr(main_module, "_recover_interrupted_rows", lambda _: None)
+    monkeypatch.setattr(main_module, "_ensure_models_available", lambda *a, **kw: None)
+    monkeypatch.setattr("musictagger.pipeline.Pipeline", _FakePipeline)
+
+    config = _make_config(tmp_path)
+    main_module._run_headless(config)
+
+    assert started.is_set(), "_run_headless must call pipeline.start()"
+    assert stopped.is_set(), "_run_headless must call pipeline.stop()"
