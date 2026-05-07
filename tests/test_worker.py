@@ -400,12 +400,15 @@ def test_predict_bpm_raises_runtime_error_on_nonetype_attribute_error(
     cache_path = tmp_path / "cache.db"
     cache = FileCache(cache_path)
     try:
-        config = Config(music_path=tmp_path)
+        config = Config(
+            music_path=tmp_path, embeddings_db_path=tmp_path / "embeddings.db"
+        )
         engine = worker_mod.Worker(cache=cache, config=config)
         monkeypatch.setattr(engine, "_get_predictor", lambda: mock_predictor)
 
         with pytest.raises(RuntimeError, match="silent or inaudible"):
             engine._predict_bpm("/fake/silent.flac")
+        engine.close()
     finally:
         cache.close()
 
@@ -423,6 +426,7 @@ def _make_worker_with_cache(tmp_path: Path) -> tuple:
     config = Config(
         music_path=tmp_path / "music",
         db_path=db_path,
+        embeddings_db_path=tmp_path / "embeddings.db",
         log_path=tmp_path / "musictagger.log",
         models_dir=tmp_path / "models",
     )
@@ -459,6 +463,7 @@ def test_run_pass_marks_error_when_process_file_returns_empty(
     assert "no tag results" in row[1]
     assert worker.errors == 1
     assert worker.processed == 0
+    worker.close()
     cache.close()
 
 
@@ -487,6 +492,7 @@ def test_run_pass_marks_done_when_process_file_returns_results(
     assert row[1] == 1  # has_bpm must be set to 1, not left as 0 or NULL
     assert worker.processed == 1
     assert worker.errors == 0
+    worker.close()
     cache.close()
 
 
@@ -511,6 +517,7 @@ def test_worker_last_activity_updates_during_run_pass(
     worker.run_pass(batch_size=1)
 
     assert worker.last_activity > 0.0
+    worker.close()
     cache.close()
 
 
@@ -622,7 +629,9 @@ def test_init_predictor_cpu_failure_raises_runtime_error(
     from musictagger.worker import Worker
     from musictagger.config import Config
 
-    config = Config(music_path=Path("/fake/music"))
+    config = Config(
+        music_path=Path("/fake/music"), embeddings_db_path=Path("/tmp/opencode/e1.db")
+    )
     worker = Worker(config, MagicMock())
 
     import deeprhythm  # type: ignore[import]
@@ -652,7 +661,9 @@ def test_predict_bpm_fallback_non_type_error_raises_runtime_error(
     from musictagger.worker import Worker
     from musictagger.config import Config
 
-    config = Config(music_path=Path("/fake/music"))
+    config = Config(
+        music_path=Path("/fake/music"), embeddings_db_path=Path("/tmp/opencode/e2.db")
+    )
     worker = Worker(config, MagicMock())
 
     # Stub out ffmpeg decode so we get a valid audio buffer.
@@ -767,6 +778,7 @@ def test_run_pass_marks_error_for_missing_file(
     config = Config(
         music_path=tmp_path / "music",
         db_path=db_path,
+        embeddings_db_path=tmp_path / "embeddings.db",
         log_path=tmp_path / "musictagger.log",
         models_dir=tmp_path / "models",
     )
@@ -789,10 +801,8 @@ def test_run_pass_marks_error_for_missing_file(
     ).fetchone()
     assert row[0] == "error"
     assert "not found" in row[1]
-    try:
-        cache.close()
-    finally:
-        pass
+    worker.close()
+    cache.close()
 
 
 def test_run_pass_marks_done_when_all_tags_already_present(
@@ -823,6 +833,7 @@ def test_run_pass_marks_done_when_all_tags_already_present(
         (str(filepath),),
     ).fetchone()
     assert row[0] == "done"
+    worker.close()
     cache.close()
 
 
@@ -940,6 +951,7 @@ def _make_worker_for_loop_tests(tmp_path: Path) -> "Worker":  # noqa: F821
     config = Config(
         music_path=tmp_path / "music",
         db_path=db_path,
+        embeddings_db_path=tmp_path / "embeddings.db",
         log_path=tmp_path / "musictagger.log",
         models_dir=tmp_path / "models",
     )

@@ -2038,16 +2038,17 @@ class Worker:
         self._stop_event.clear()
 
     def close(self) -> None:
-        """Flush and close the embedding cache and cancel pending prefetch work.
+        """Flush and close the embedding cache.
 
-        Call this once when the worker is permanently shut down (e.g. on app
-        exit).  Safe to call multiple times.
+        Call this once when the worker is permanently shut down.  Safe to call
+        multiple times.
 
-        Shuts down _PREFETCH_POOL with cancel_futures=True so any queued but
-        not-yet-started ffmpeg decodes are discarded immediately.  In-flight
-        decodes on daemon threads will be abandoned when the process exits.
+        Note: _PREFETCH_POOL is module-level and shared across Worker instances.
+        It is intentionally not shut down here — the daemon threads it manages
+        will be abandoned naturally when the process exits.  Shutting the pool
+        down here would permanently poison the module for any subsequent Worker
+        instances in the same process (e.g. in tests).  If an explicit flush of
+        queued prefetch work is needed at process exit, call
+        ``_PREFETCH_POOL.shutdown(wait=False, cancel_futures=True)`` directly.
         """
         self._embedding_cache.close()
-        # cancel_futures=True drops queued work; wait=False returns immediately
-        # rather than blocking until in-flight daemon threads finish.
-        _PREFETCH_POOL.shutdown(wait=False, cancel_futures=True)

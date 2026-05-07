@@ -32,6 +32,7 @@ def _make_config(
     return Config(
         music_path=tmp_path,
         db_path=tmp_path / "cache.db",
+        embeddings_db_path=tmp_path / "embeddings.db",
         log_path=tmp_path / "musictagger.log",
         inspector_throttle_ms=0,
         inspector_batch_size=10,
@@ -345,6 +346,7 @@ def test_worker_missing_tags_excludes_disabled_tags(tmp_path: Path) -> None:
         missing = worker._missing_tags(str(filepath))
 
         assert "bpm" not in missing
+        worker.close()
     finally:
         cache.close()
 
@@ -371,6 +373,7 @@ def test_worker_missing_tags_includes_overwrite_tags_even_when_present(
         missing = worker._missing_tags(str(filepath))
 
         assert "bpm" in missing
+        worker.close()
     finally:
         cache.close()
 
@@ -393,6 +396,7 @@ def test_worker_missing_tags_normal_tag_not_included_when_present(
         missing = worker._missing_tags(str(filepath))
 
         assert missing == []
+        worker.close()
     finally:
         cache.close()
 
