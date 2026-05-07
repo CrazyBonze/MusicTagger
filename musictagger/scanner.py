@@ -30,6 +30,7 @@ used:
 from __future__ import annotations
 
 import os
+import threading
 import time
 from concurrent.futures import (
     Future,
@@ -114,6 +115,8 @@ class Scanner:
         self.cache = cache
         self._log = log_fn or (lambda msg: None)
         self._running = False
+        # Stop signal — set by stop(), cleared by reset().
+        self._stop_event = threading.Event()
         self._files_scanned = 0
         self._files_changed = 0
         self._current_file = ""
@@ -196,7 +199,7 @@ class Scanner:
             # skip individual directories that time out.
             dir_queue: list[str] = [str(music_path)]
 
-            while dir_queue and self._running:
+            while dir_queue and not self._stop_event.is_set():
                 dirpath_str = dir_queue.pop(0)
 
                 # Submit the directory listing to a thread with a timeout so
@@ -242,7 +245,7 @@ class Scanner:
                     dir_queue.insert(0, os.path.join(dirpath_str, subdir))
 
                 for filename in audio_files:
-                    if not self._running:
+                    if self._stop_event.is_set():
                         break
 
                     filepath = Path(dirpath_str) / filename
@@ -272,7 +275,7 @@ class Scanner:
                     if file_sleep > 0:
                         time.sleep(file_sleep)
 
-                if self._running and dir_sleep > 0:
+                if not self._stop_event.is_set() and dir_sleep > 0:
                     time.sleep(dir_sleep)
 
         except Exception as exc:
@@ -282,7 +285,7 @@ class Scanner:
             executor.shutdown(wait=False)
             self.cache.flush()
             # Capture whether we finished normally before clearing the flag.
-            finished_normally = self._running
+            finished_normally = not self._stop_event.is_set()
             self._running = False
             self._current_file = ""
 
@@ -300,4 +303,9 @@ class Scanner:
 
     def stop(self) -> None:
         """Signal the running pass to stop at the next iteration."""
+        self._stop_event.set()
         self._running = False
+
+    def reset(self) -> None:
+        """Clear the stop signal so the scanner can be relaunched."""
+        self._stop_event.clear()

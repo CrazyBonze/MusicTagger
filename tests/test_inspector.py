@@ -53,9 +53,103 @@ def test_inspector_marks_missing_file_as_needing_work(tmp_path: Path) -> None:
         assert inspector.errors == 0
         assert cache.needs_inspection() == []
         assert cache.needs_work() == [str(filepath)]
-        assert cache.stats()["per_tag"] == {tag.name: 0 for tag in TAGS}
+        assert cache.stats()["done"] == 0
     finally:
         cache.close()
+
+
+# ── Inspector.stop() / threading.Event ───────────────────────────────────────
+
+
+def test_inspector_stop_sets_stop_event() -> None:
+    """stop() must set the threading.Event so the file loop exits cleanly."""
+    import musictagger.inspector as inspector_mod
+
+    inspector = inspector_mod.Inspector.__new__(inspector_mod.Inspector)
+    inspector._stop_event = __import__("threading").Event()
+    inspector._running = False
+
+    assert not inspector._stop_event.is_set()
+    inspector.stop()
+    assert inspector._stop_event.is_set()
+
+
+def test_inspector_reset_clears_stop_event() -> None:
+    """reset() must clear the stop event so the inspector can be relaunched."""
+    import musictagger.inspector as inspector_mod
+
+    inspector = inspector_mod.Inspector.__new__(inspector_mod.Inspector)
+    inspector._stop_event = __import__("threading").Event()
+    inspector._stop_event.set()
+
+    inspector.reset()
+    assert not inspector._stop_event.is_set()
+
+
+# ── Inspector.run() — drains the queue across multiple passes ─────────────────
+
+
+def test_inspector_run_loops_until_queue_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inspector.run() must call run_pass() repeatedly until it returns 0.
+
+    This is the counterpart to test_worker_loop_continues_across_batches:
+    the inspector must not stop after one batch when there is more work.
+    """
+    import musictagger.inspector as inspector_mod
+
+    cache = FileCache(tmp_path / "cache.db")
+    config = _make_config(tmp_path)
+    inspector = inspector_mod.Inspector(config, cache)
+
+    return_values = [3, 3, 3, 0]
+    call_count = [0]
+
+    def _fake_run_pass(self: object) -> int:
+        result = return_values[call_count[0]]
+        call_count[0] += 1
+        inspector._running = False  # mirrors real run_pass() behaviour
+        return result
+
+    monkeypatch.setattr(inspector_mod.Inspector, "run_pass", _fake_run_pass)
+
+    inspector.run()
+
+    assert call_count[0] == len(return_values), (
+        f"run_pass() called {call_count[0]} time(s); expected {len(return_values)}. "
+        "Inspector.run() is not looping until the queue is empty."
+    )
+    cache.close()
+
+
+def test_inspector_run_stops_when_stop_is_called(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inspector.run() must exit cleanly when stop() is called between passes."""
+    import musictagger.inspector as inspector_mod
+
+    cache = FileCache(tmp_path / "cache.db")
+    config = _make_config(tmp_path)
+    inspector = inspector_mod.Inspector(config, cache)
+
+    call_count = [0]
+
+    def _fake_run_pass(self: object) -> int:
+        call_count[0] += 1
+        inspector.stop()
+        inspector._running = False
+        return 3  # non-zero — queue not empty
+
+    monkeypatch.setattr(inspector_mod.Inspector, "run_pass", _fake_run_pass)
+
+    inspector.run()
+
+    assert call_count[0] == 1, (
+        f"run_pass() called {call_count[0]} time(s); expected 1. "
+        "Inspector.run() did not respect stop()."
+    )
+    cache.close()
 
 
 def test_inspector_marks_unrecognised_format_as_needing_work(

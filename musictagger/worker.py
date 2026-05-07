@@ -1366,11 +1366,10 @@ class Worker:
         # branch on whether markup is available.
         self._log_markup = markup_log_fn or self._log
         self._running = False
-        # Set by stop() and checked at the top of run_pass() so the worker
-        # loop in tui.py cannot re-enter run_pass() after shutdown has begun.
-        # Distinct from _running (which flips on/off within a pass) so that
-        # stop() cannot be confused with the normal between-pass idle state.
-        self._stop_requested = False
+        # Stop signal — set by stop(), cleared by reset().  Replaces the old
+        # _stop_requested bool: threading.Event is the standard Python idiom
+        # for cross-thread stop signalling and makes the semantics explicit.
+        self._stop_event = threading.Event()
         self._processed = 0
         self._errors = 0
         self._predictor = None  # lazy — imported and initialised on first use
@@ -1613,10 +1612,10 @@ class Worker:
         empty — callers use this as the "nothing left to do" signal.
         """
         # Refuse to start a new pass after stop() has been called.  This closes
-        # the race between the _worker_loop in tui.py (which loops until 0 is
-        # returned) and the shutdown sequence (which closes the DB immediately
-        # once worker.running flips to False between passes).
-        if self._stop_requested:
+        # the race between Worker.run() (which loops until 0 is returned) and
+        # the shutdown sequence (which closes the DB immediately once
+        # worker.running flips to False between passes).
+        if self._stop_event.is_set():
             return 0
         self._running = True
         self._last_activity = time.monotonic()
@@ -1656,7 +1655,7 @@ class Worker:
         )
 
         for i, filepath_str in enumerate(filepaths):
-            if not self._running:
+            if self._stop_event.is_set():
                 # Best-effort cancel; the thread may already be running.
                 if current_prefetch is not None:
                     current_prefetch.cancel()
@@ -2016,9 +2015,27 @@ class Worker:
 
         return results
 
+    def run(self, batch_size: int = 20) -> None:
+        """Drain the work queue by calling run_pass() until empty.
+
+        Loops immediately between passes so a full batch triggers the next
+        pass without waiting for an external scheduler tick — keeping the
+        ML models warm in memory across batches.  Exits when run_pass()
+        returns 0 (empty queue) or stop() is called.
+        """
+        while not self._stop_event.is_set():
+            processed = self.run_pass(batch_size)
+            if processed == 0:
+                break
+
     def stop(self) -> None:
-        self._stop_requested = True
+        """Signal the worker to stop at the next iteration boundary."""
+        self._stop_event.set()
         self._running = False
+
+    def reset(self) -> None:
+        """Clear the stop signal so the worker can be relaunched."""
+        self._stop_event.clear()
 
     def close(self) -> None:
         """Flush and close the embedding cache and cancel pending prefetch work.

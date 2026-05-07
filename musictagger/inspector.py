@@ -28,6 +28,7 @@ EffNet embeddings without recomputing them.
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -111,6 +112,10 @@ class Inspector:
         self.cache = cache
         self._log = log_fn or (lambda msg: None)
         self._running = False
+        # Stop signal — set by stop(), cleared by reset().  The Pipeline calls
+        # reset() before each new run so the inspector can be relaunched after
+        # a pause or between cron cycles cleanly.
+        self._stop_event = threading.Event()
         self._inspected = 0
         self._queued = 0
         self._errors = 0
@@ -175,7 +180,7 @@ class Inspector:
             return 0
 
         for filepath_str in filepaths:
-            if not self._running:
+            if self._stop_event.is_set():
                 break
 
             filepath = Path(filepath_str)
@@ -291,5 +296,23 @@ class Inspector:
         self._current_file = ""
         return inspected
 
+    def run(self) -> None:
+        """Drain the inspection queue by calling run_pass() until empty.
+
+        Loops immediately between passes so a full batch triggers the next
+        pass without waiting for an external scheduler tick.  Exits when
+        run_pass() returns 0 (empty queue) or stop() is called.
+        """
+        while not self._stop_event.is_set():
+            processed = self.run_pass()
+            if processed == 0:
+                break
+
     def stop(self) -> None:
+        """Signal the inspector to stop at the next iteration boundary."""
+        self._stop_event.set()
         self._running = False
+
+    def reset(self) -> None:
+        """Clear the stop signal so the inspector can be relaunched."""
+        self._stop_event.clear()

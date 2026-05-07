@@ -159,8 +159,11 @@ def test_scanner_heartbeat_updated_per_directory(tmp_path: Path) -> None:
 
 def test_scanner_stop_clears_running_flag() -> None:
     """scanner.stop() sets _running=False so the watchdog can relaunch."""
+    import threading as _threading
+
     scanner = Scanner.__new__(Scanner)
     scanner._running = True
+    scanner._stop_event = _threading.Event()
     scanner._files_scanned = 0
     scanner._files_changed = 0
     scanner._current_file = ""
@@ -321,3 +324,31 @@ def test_scanner_requeues_file_modified_externally_after_worker_write(
         assert cache.stats()["done"] == 0
     finally:
         cache.close()
+
+
+# ── Scanner.stop() / threading.Event ──────────────────────────────────────────
+
+
+def test_scanner_stop_sets_stop_event() -> None:
+    """stop() must set the threading.Event so the file loop exits cleanly."""
+    from musictagger.scanner import Scanner
+
+    scanner = Scanner.__new__(Scanner)
+    scanner._running = False
+    scanner._stop_event = __import__("threading").Event()
+
+    assert not scanner._stop_event.is_set()
+    scanner.stop()
+    assert scanner._stop_event.is_set()
+
+
+def test_scanner_reset_clears_stop_event() -> None:
+    """reset() must clear the stop event so the scanner can be relaunched."""
+    from musictagger.scanner import Scanner
+
+    scanner = Scanner.__new__(Scanner)
+    scanner._stop_event = __import__("threading").Event()
+    scanner._stop_event.set()
+
+    scanner.reset()
+    assert not scanner._stop_event.is_set()

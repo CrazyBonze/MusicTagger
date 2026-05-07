@@ -1008,6 +1008,7 @@ class MusicTaggerApp(App):
         if now >= self._next_scan and not self.scanner.running:
             self._last_scan = now
             self._next_scan = _cron_next(self.config.scan_cron)
+            self.scanner.reset()
             self.run_worker(
                 self.scanner.run_pass,
                 thread=True,
@@ -1016,11 +1017,15 @@ class MusicTaggerApp(App):
                 exit_on_error=False,
             )
 
-        # Inspector — run continuously while there's a queue
+        # Inspector — run continuously while there's a queue.
+        # inspector.run() loops run_pass() internally until the queue drains,
+        # so a full batch immediately triggers the next pass without waiting
+        # for the next 5 s orchestrator tick.
         if not self.inspector.running:
             if self._stats_cache["needs_inspection"] > 0:
+                self.inspector.reset()
                 self.run_worker(
-                    self.inspector.run_pass,
+                    self.inspector.run,
                     thread=True,
                     group="inspector",
                     exclusive=True,
@@ -1102,36 +1107,12 @@ class MusicTaggerApp(App):
                 )
 
             if self._stats_cache["needs_work"] > 0 and not self._quitting:
-                # Clear any previous stop_requested so the loop can run.
-                # Only do this when not quitting — during shutdown the flag
+                # reset() clears the stop event so run() can enter its loop.
+                # Only do this when not quitting — during shutdown the event
                 # must stay set so run_pass() refuses to re-enter.
-                self.worker._stop_requested = False
-
-                def _worker_loop() -> None:
-                    # Run consecutive passes until the queue is empty or the
-                    # worker is stopped externally (e.g. pause, shutdown).
-                    # Looping here avoids the up-to-5 s orchestrator gap
-                    # between batches while the ML models are already warm in
-                    # memory — the models are the expensive part to load, not
-                    # individual batch dispatch.
-                    #
-                    # Exit conditions:
-                    #   - run_pass() returns 0: queue is empty, nothing left.
-                    #   - _stop_requested is set: stop() was called between
-                    #     passes (pause, quit, watchdog).  Checked on the
-                    #     while guard rather than the break so that a stop()
-                    #     arriving while run_pass() is executing is caught at
-                    #     the next iteration boundary without needing to
-                    #     inspect _running (which run_pass() always sets False
-                    #     before returning, making it useless as a loop-exit
-                    #     signal for the normal completion case).
-                    while not self.worker._stop_requested:
-                        processed = self.worker.run_pass(self.config.worker_batch_size)
-                        if processed == 0:
-                            break
-
+                self.worker.reset()
                 self.run_worker(
-                    _worker_loop,
+                    lambda: self.worker.run(self.config.worker_batch_size),
                     thread=True,
                     group="worker",
                     exclusive=True,
@@ -1151,6 +1132,7 @@ class MusicTaggerApp(App):
         if now >= self._next_cleanup and not self.cleanup.running:
             self._last_cleanup = now
             self._next_cleanup = _cron_next(self.config.cleanup_cron)
+            self.cleanup.reset()
             self.run_worker(
                 self.cleanup.run,
                 thread=True,
@@ -1171,6 +1153,7 @@ class MusicTaggerApp(App):
         # immediately re-trigger once the job finishes.  The orchestrator will
         # compute the real next cron tick once this run completes.
         self._next_scan = float("inf")
+        self.scanner.reset()
         self.run_worker(
             self.scanner.run_pass,
             thread=True,
@@ -1184,8 +1167,9 @@ class MusicTaggerApp(App):
             self._applog("Inspector already running")
             return
         self._applog("Forcing inspection pass…")
+        self.inspector.reset()
         self.run_worker(
-            self.inspector.run_pass,
+            self.inspector.run,
             thread=True,
             group="inspector",
             exclusive=True,
@@ -1202,6 +1186,7 @@ class MusicTaggerApp(App):
         # immediately re-trigger once the job finishes.  The orchestrator will
         # compute the real next cron tick once this run completes.
         self._next_cleanup = float("inf")
+        self.cleanup.reset()
         self.run_worker(
             self.cleanup.run,
             thread=True,

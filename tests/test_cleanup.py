@@ -58,3 +58,31 @@ def test_cleanup_noops_when_all_cached_files_exist(tmp_path: Path) -> None:
         assert cache.all_filepaths() == [str(existing)]
     finally:
         cache.close()
+
+
+# ── Cleanup.stop() / threading.Event ─────────────────────────────────────────
+
+
+def test_cleanup_stop_sets_stop_event() -> None:
+    """stop() must set the threading.Event so the check loop exits cleanly."""
+    from musictagger.cleanup import Cleanup
+
+    cleanup = Cleanup.__new__(Cleanup)
+    cleanup._running = False
+    cleanup._stop_event = __import__("threading").Event()
+
+    assert not cleanup._stop_event.is_set()
+    cleanup.stop()
+    assert cleanup._stop_event.is_set()
+
+
+def test_cleanup_reset_clears_stop_event() -> None:
+    """reset() must clear the stop event so cleanup can be relaunched."""
+    from musictagger.cleanup import Cleanup
+
+    cleanup = Cleanup.__new__(Cleanup)
+    cleanup._stop_event = __import__("threading").Event()
+    cleanup._stop_event.set()
+
+    cleanup.reset()
+    assert not cleanup._stop_event.is_set()

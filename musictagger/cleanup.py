@@ -11,6 +11,7 @@ Run it infrequently (daily is plenty for most libraries).
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -34,6 +35,8 @@ class Cleanup:
         self.cache = cache
         self._log = log_fn or (lambda msg: None)
         self._running = False
+        # Stop signal — set by stop(), cleared by reset().
+        self._stop_event = threading.Event()
         self._last_removed = 0
         # Rate tracking: total paths in the last run and how many have been
         # checked so far, plus the monotonic start time.
@@ -94,7 +97,7 @@ class Cleanup:
         missing: list[str] = []
 
         for path_str in all_paths:
-            if not self._running:
+            if self._stop_event.is_set():
                 break
             if not Path(path_str).exists():
                 missing.append(path_str)
@@ -118,4 +121,10 @@ class Cleanup:
         return len(missing)
 
     def stop(self) -> None:
+        """Signal the running pass to stop at the next iteration."""
+        self._stop_event.set()
         self._running = False
+
+    def reset(self) -> None:
+        """Clear the stop signal so cleanup can be relaunched."""
+        self._stop_event.clear()

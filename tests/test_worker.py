@@ -949,60 +949,39 @@ def _make_worker_for_loop_tests(tmp_path: Path) -> "Worker":  # noqa: F821
 def test_worker_loop_continues_across_batches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """_worker_loop must call run_pass() again after a non-zero return.
+    """Worker.run() must call run_pass() again after a non-zero return.
 
-    This is a regression test for the bug where the loop broke after every
-    batch because run_pass() sets _running=False before returning, and the
-    original break condition was ``processed == 0 or not worker._running``.
-    That made the ``not worker._running`` branch always True on a completed
-    pass, exiting the loop after a single batch regardless of queue depth.
-
-    The correct condition is ``processed == 0`` only; the ``while not
-    _stop_requested`` guard already handles all external stop signals.
+    Regression test for the bug where the loop broke after every batch because
+    run_pass() sets _running=False before returning.  Now the loop lives in
+    Worker.run() and uses _stop_event as the sole exit signal.
     """
     import musictagger.worker as worker_mod
 
     worker = _make_worker_for_loop_tests(tmp_path)
 
-    # Simulate three batches of 5 files each, then an empty queue.
     return_values = [5, 5, 5, 0]
     call_count = [0]
 
     def _fake_run_pass(self: object, batch_size: int = 20) -> int:
         result = return_values[call_count[0]]
         call_count[0] += 1
-        # Mirror what real run_pass() does: _running is False when it returns.
         worker._running = False
         return result
 
     monkeypatch.setattr(worker_mod.Worker, "run_pass", _fake_run_pass)
 
-    # Replicate the _worker_loop logic from tui.py exactly.
-    while not worker._stop_requested:
-        processed = worker.run_pass(50)
-        if processed == 0:
-            break
+    worker.run(50)
 
-    # With the bug present the loop exits after the first batch (call_count==1).
-    # With the fix it should run all three non-zero batches plus the empty one.
     assert call_count[0] == len(return_values), (
         f"run_pass() was called {call_count[0]} time(s); expected "
-        f"{len(return_values)} (3 batches + 1 empty-queue termination). "
-        "The _worker_loop is breaking too early — check the break condition "
-        "in tui.py: it must only break on ``processed == 0``, not on "
-        "``not worker._running``."
+        f"{len(return_values)} (3 batches + 1 empty-queue termination)."
     )
 
 
 def test_worker_loop_stops_when_stop_is_requested(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """_worker_loop must exit cleanly when stop() is called between passes.
-
-    stop() sets _stop_requested=True, which the ``while not _stop_requested``
-    guard catches before the next run_pass() call.  This must work both before
-    and after the break-condition fix.
-    """
+    """Worker.run() must exit cleanly when stop() is called between passes."""
     import musictagger.worker as worker_mod
 
     worker = _make_worker_for_loop_tests(tmp_path)
@@ -1011,21 +990,100 @@ def test_worker_loop_stops_when_stop_is_requested(
 
     def _fake_run_pass(self: object, batch_size: int = 20) -> int:
         call_count[0] += 1
-        # After the first pass, simulate an external stop (e.g. pause/quit).
         worker.stop()
         worker._running = False
-        return 5  # non-zero — queue not empty
+        return 5
 
     monkeypatch.setattr(worker_mod.Worker, "run_pass", _fake_run_pass)
 
-    while not worker._stop_requested:
-        processed = worker.run_pass(50)
-        if processed == 0:
-            break
+    worker.run(50)
 
-    # The loop must have called run_pass exactly once, then exited because
-    # _stop_requested was set — not because the queue was empty.
     assert call_count[0] == 1, (
         f"run_pass() was called {call_count[0]} time(s); expected 1. "
-        "The loop did not respect _stop_requested."
+        "Worker.run() did not respect stop()."
+    )
+
+
+# ── Worker.stop() / threading.Event ───────────────────────────────────────────
+
+
+def test_worker_stop_sets_stop_event(tmp_path: Path) -> None:
+    """stop() must set the threading.Event so the file loop exits cleanly.
+
+    After this change _stop_requested is replaced by _stop_event.
+    """
+    worker = _make_worker_for_loop_tests(tmp_path)
+
+    assert not worker._stop_event.is_set()
+    worker.stop()
+    assert worker._stop_event.is_set()
+
+
+def test_worker_reset_clears_stop_event(tmp_path: Path) -> None:
+    """reset() must clear the stop event so the worker can be relaunched."""
+    worker = _make_worker_for_loop_tests(tmp_path)
+    worker.stop()
+    assert worker._stop_event.is_set()
+
+    worker.reset()
+    assert not worker._stop_event.is_set()
+
+
+# ── Worker.run() — drains the queue across multiple passes ────────────────────
+
+
+def test_worker_run_loops_until_queue_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Worker.run() must call run_pass() repeatedly until it returns 0.
+
+    This supersedes the _worker_loop closure test now that the loop logic
+    lives in Worker.run() rather than the TUI.
+    """
+    import musictagger.worker as worker_mod
+
+    worker = _make_worker_for_loop_tests(tmp_path)
+
+    return_values = [5, 5, 5, 0]
+    call_count = [0]
+
+    def _fake_run_pass(self: object, batch_size: int = 20) -> int:
+        result = return_values[call_count[0]]
+        call_count[0] += 1
+        worker._running = False
+        return result
+
+    monkeypatch.setattr(worker_mod.Worker, "run_pass", _fake_run_pass)
+
+    worker.run(50)
+
+    assert call_count[0] == len(return_values), (
+        f"run_pass() called {call_count[0]} time(s); expected {len(return_values)}. "
+        "Worker.run() is not looping until the queue is empty."
+    )
+
+
+def test_worker_run_stops_when_stop_is_called(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Worker.run() must exit cleanly when stop() is called between passes."""
+    import musictagger.worker as worker_mod
+
+    worker = _make_worker_for_loop_tests(tmp_path)
+
+    call_count = [0]
+
+    def _fake_run_pass(self: object, batch_size: int = 20) -> int:
+        call_count[0] += 1
+        worker.stop()
+        worker._running = False
+        return 5
+
+    monkeypatch.setattr(worker_mod.Worker, "run_pass", _fake_run_pass)
+
+    worker.run(50)
+
+    assert call_count[0] == 1, (
+        f"run_pass() called {call_count[0]} time(s); expected 1. "
+        "Worker.run() did not respect stop()."
     )
