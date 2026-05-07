@@ -258,15 +258,7 @@ def main() -> None:
         _run_headless(config)
     else:
         app = MusicTaggerApp(config)
-        try:
-            app.run()
-        finally:
-            # Flush the loguru enqueue buffer before exit.  enqueue=True writes
-            # log records via a background thread; without this the thread can be
-            # killed by interpreter shutdown before the last records reach disk.
-            from loguru import logger
-
-            logger.complete()
+        app.run()
 
 
 def _run_headless(config: Config) -> None:
@@ -308,7 +300,7 @@ def _run_headless(config: Config) -> None:
     pipeline.close()
 
     logger.info("musictagger headless mode stopped")
-    logger.complete()
+    _flush_log_with_timeout(timeout=2.0)
 
 
 def _run() -> None:
@@ -334,7 +326,36 @@ def _run() -> None:
         # Ctrl+C while the TUI is running — Textual has already called
         # on_unmount and cleaned up.  Fall through to os._exit() below.
         pass
+
+    # Best-effort flush of the loguru enqueue buffer before forcing exit.
+    # enqueue=True writes records via a background thread; we give it up to
+    # 2 seconds to drain.  If it takes longer we still force-exit — a clean
+    # terminal is more important than preserving the last few log lines.
+    # os._exit() is used rather than sys.exit() because PyTorch/TensorFlow/
+    # Essentia spin up non-daemon C-level thread pools that would otherwise
+    # block interpreter shutdown indefinitely.
+    _flush_log_with_timeout(timeout=2.0)
     os._exit(0)
+
+
+def _flush_log_with_timeout(timeout: float) -> None:
+    """Try to flush the loguru async queue, giving up after *timeout* seconds."""
+    import threading as _threading
+    from loguru import logger as _logger
+
+    done = _threading.Event()
+
+    def _flush() -> None:
+        try:
+            _logger.complete()
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    t = _threading.Thread(target=_flush, daemon=True)
+    t.start()
+    done.wait(timeout=timeout)
 
 
 if __name__ == "__main__":
