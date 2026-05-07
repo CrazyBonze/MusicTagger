@@ -1,0 +1,36 @@
+[project]
+name = "musictagger"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "textual>=0.50.0",
+    "mutagen>=1.47.0",
+    "deeprhythm>=0.0.13",
+    "numpy>=1.24",
+    "loguru>=0.7.3",
+    "essentia-tensorflow>=2.1b6.dev0",
+    "croniter>=2.0",
+    "pyacoustid>=1.3.0",
+]
+
+[project.scripts]
+musictagger = "musictagger.__main__:_run"
+musictagger-download-models = "musictagger.download_models:main"
+musictagger-clear-tags = "musictagger.clear_tags:main"
+musictagger-inspect-tags = "musictagger.inspect_tags:main"
+musictagger-migrate-embeddings = "musictagger.migrate_embeddings:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["musictagger"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.15.8",
+]
