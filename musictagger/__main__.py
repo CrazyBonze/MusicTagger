@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import TextIO
 
 from musictagger.cache import FileCache
 from musictagger.config import DEFAULT_CONFIG_PATH, Config
@@ -47,7 +48,7 @@ def _ensure_models_available(
     config: Config,
     policy: str,
     *,
-    stdin: object | None = None,
+    stdin: TextIO | None = None,
 ) -> None:
     missing = missing_models(config.models_dir)
     if not missing or policy == "never":
@@ -55,7 +56,7 @@ def _ensure_models_available(
 
     if policy == "ask":
         stream = sys.stdin if stdin is None else stdin
-        if not stream.isatty():
+        if stream is None or not stream.isatty():
             print(
                 "Essentia models are missing; skipping download in non-interactive mode.",
                 file=sys.stderr,
