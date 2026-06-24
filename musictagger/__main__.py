@@ -307,9 +307,7 @@ def _run_headless(config: Config) -> None:
 
     pipeline = Pipeline(config)
     pipeline.on_log = lambda source, msg: _print_line(source, msg)
-    pipeline.on_log_markup = lambda source, msg: _print_line(
-        source, msg, markup=True
-    )
+    pipeline.on_log_markup = lambda source, msg: _print_line(source, msg, markup=True)
 
     stop_requested = threading.Event()
 
@@ -333,33 +331,40 @@ def _run_headless(config: Config) -> None:
 
     pipeline.start()
 
-    # ── Main loop — print a stats summary every _STATS_INTERVAL_S seconds ────
+    # ── Main loop — print a stats summary when the cached values change ─────
 
-    _STATS_INTERVAL_S = 30
+    _STATS_INTERVAL_S = 60
     _last_stats_print: float = 0.0
+    _last_stats: dict[str, int] | None = None
 
     while pipeline.running and not stop_requested.is_set():
         stop_requested.wait(timeout=1.0)
 
         now = time.monotonic()
         if now - _last_stats_print >= _STATS_INTERVAL_S:
-            _last_stats_print = now
             try:
                 stats = pipeline.stats
-                total = stats.get("total", 0)
-                done = stats.get("done", 0)
-                needs_work = stats.get("needs_work", 0)
-                needs_inspection = stats.get("needs_inspection", 0)
-                errors = stats.get("errors", 0)
-                print(
-                    f"[stats] total={total:,}  done={done:,}"
-                    f"  needs_work={needs_work:,}"
-                    f"  uninspected={needs_inspection:,}"
-                    f"  errors={errors:,}",
-                    flush=True,
-                )
+                current = {
+                    "total": stats.get("total", 0),
+                    "done": stats.get("done", 0),
+                    "needs_work": stats.get("needs_work", 0),
+                    "needs_inspection": stats.get("needs_inspection", 0),
+                    "errors": stats.get("errors", 0),
+                }
+                if current == _last_stats:
+                    continue
             except Exception:
-                pass  # stale stats — not worth crashing the loop
+                continue  # stale stats — not worth crashing the loop
+
+            _last_stats_print = now
+            _last_stats = current
+            print(
+                f"[stats] total={current['total']:,}  done={current['done']:,}"
+                f"  needs_work={current['needs_work']:,}"
+                f"  uninspected={current['needs_inspection']:,}"
+                f"  errors={current['errors']:,}",
+                flush=True,
+            )
 
     pipeline.stop()
     pipeline.join(timeout=15.0)
