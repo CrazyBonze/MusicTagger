@@ -1704,6 +1704,8 @@ class Worker:
             missing = self._missing_tags(filepath_str)
             if not missing:
                 # Inspector already satisfied this file; mark done and move on.
+                self._log(f"Already tagged: {filepath.name}")
+                logger.debug("Already tagged, marking done: {}", filepath.name)
                 self.cache.mark_done(filepath)
                 if current_prefetch is not None:
                     try:

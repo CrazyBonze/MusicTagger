@@ -7,6 +7,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 from musictagger.cache import FileCache
@@ -264,19 +265,57 @@ def main() -> None:
 def _run_headless(config: Config) -> None:
     """Run the full pipeline without a TUI.
 
-    Starts the Pipeline, installs SIGINT/SIGTERM handlers for clean shutdown,
-    then blocks until a stop signal is received or the pipeline exits on its
-    own.  All observability comes from the loguru log file and stderr.
+    Starts the Pipeline, wires log callbacks so every stage message is printed
+    to the terminal with a timestamp and source prefix, then blocks until a
+    stop signal is received or the pipeline exits on its own.
+
+    Output format::
+
+        12:34:56 [scanner]  Scanning /path/to/music
+        12:34:57 [worker]   Techno (0.82) — /path/to/track.flac
+
+    A brief stats summary is also printed every 30 seconds so overall progress
+    is visible without scrolling through individual file lines.
+
+    Send SIGINT (Ctrl-C) or SIGTERM to stop cleanly.
     """
+    import re
+
     from loguru import logger
+
     from musictagger.pipeline import Pipeline
 
+    # ── Markup stripping ──────────────────────────────────────────────────────
+    # Rich markup tags look like [bold], [/bold], [bold cyan], [on green], etc.
+    # Strip them so markup-carrying worker lines (mood scores, BPM results) are
+    # readable plain text rather than showing raw bracket tokens.
+    _MARKUP_RE = re.compile(r"\[/?[a-zA-Z][^\[\]]*\]")
+
+    def _strip_markup(text: str) -> str:
+        return _MARKUP_RE.sub("", text)
+
+    # ── Terminal log callback ─────────────────────────────────────────────────
+
+    def _print_line(source: str, msg: str, *, markup: bool = False) -> None:
+        from datetime import datetime
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        body = _strip_markup(msg) if markup else msg
+        print(f"{ts} [{source}] {body}", flush=True)
+
+    # ── Pipeline wiring ───────────────────────────────────────────────────────
+
     pipeline = Pipeline(config)
+    pipeline.on_log = lambda source, msg: _print_line(source, msg)
+    pipeline.on_log_markup = lambda source, msg: _print_line(
+        source, msg, markup=True
+    )
 
     stop_requested = threading.Event()
 
     def _handle_signal(signum: int, frame: object) -> None:
         logger.info("Signal {} received — stopping pipeline", signum)
+        print(f"\nReceived signal {signum} — stopping…", flush=True)
         stop_requested.set()
         pipeline.stop()
 
@@ -288,18 +327,46 @@ def _run_headless(config: Config) -> None:
         config.music_path,
         config.db_path,
     )
+    print(f"musictagger headless — library: {config.music_path}", flush=True)
+    print(f"database: {config.db_path}", flush=True)
+    print("Press Ctrl-C to stop.\n", flush=True)
 
     pipeline.start()
 
-    # Block the main thread until a signal fires or the pipeline stops itself.
+    # ── Main loop — print a stats summary every _STATS_INTERVAL_S seconds ────
+
+    _STATS_INTERVAL_S = 30
+    _last_stats_print: float = 0.0
+
     while pipeline.running and not stop_requested.is_set():
         stop_requested.wait(timeout=1.0)
+
+        now = time.monotonic()
+        if now - _last_stats_print >= _STATS_INTERVAL_S:
+            _last_stats_print = now
+            try:
+                stats = pipeline.stats
+                total = stats.get("total", 0)
+                done = stats.get("done", 0)
+                needs_work = stats.get("needs_work", 0)
+                needs_inspection = stats.get("needs_inspection", 0)
+                errors = stats.get("errors", 0)
+                print(
+                    f"[stats] total={total:,}  done={done:,}"
+                    f"  needs_work={needs_work:,}"
+                    f"  uninspected={needs_inspection:,}"
+                    f"  errors={errors:,}",
+                    flush=True,
+                )
+            except Exception:
+                pass  # stale stats — not worth crashing the loop
 
     pipeline.stop()
     pipeline.join(timeout=15.0)
     pipeline.close()
 
     logger.info("musictagger headless mode stopped")
+    print("\nmusictagger headless stopped.", flush=True)
     _flush_log_with_timeout(timeout=2.0)
 
 

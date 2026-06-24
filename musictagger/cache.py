@@ -71,7 +71,14 @@ class FileCache:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._path = db_path
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        # timeout= tells the Python sqlite3 driver how long to retry on a
+        # "database is locked" condition before raising OperationalError.
+        # The default is 5 s, but we set it explicitly to 30 s to handle the
+        # case where a previous process was killed mid-write and left an
+        # uncommitted WAL transaction.  SQLite clears stale locks within
+        # milliseconds once the dead process is gone; 30 s is a generous
+        # safety margin that costs nothing in the normal case.
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         # Disable SQLite's automatic WAL checkpoint (default threshold: 1000
@@ -642,16 +649,32 @@ class FileCache:
         frames.  Running it here prevents the WAL from growing until SQLite
         triggers its own auto-checkpoint inside a COMMIT (which can stall
         writers for several seconds and freeze the stats-refresh thread).
+
+        The checkpoint pragma is intentionally run *outside* the write lock.
+        PASSIVE never acquires an exclusive lock and never blocks writers, so
+        it does not need to be serialised with other cache operations.  Holding
+        the lock across the checkpoint call was the source of "database is
+        locked" errors: a concurrent write (e.g. mark_changed() from the
+        scanner thread) would try to acquire the lock while the checkpoint
+        pragma was executing, and SQLite's internal locking occasionally
+        surfaced that contention as OperationalError("database is locked").
         """
+        run_checkpoint = False
         with self._lock:
             if self._closed:
                 return
             self._conn.commit()
             self._flush_count += 1
             if self._flush_count % _FLUSH_CHECKPOINT_INTERVAL == 0:
-                # wal_checkpoint(PASSIVE) never blocks; it returns immediately
-                # if any frame is still needed by an open reader.
+                run_checkpoint = True
+        if run_checkpoint:
+            # wal_checkpoint(PASSIVE) never blocks; it returns immediately
+            # if any frame is still needed by an open reader.  Errors here
+            # are non-fatal — the WAL will be checkpointed on the next pass.
+            try:
                 self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception as exc:
+                logger.debug("WAL checkpoint skipped: {}", exc)
 
     def close(self) -> None:
         with self._lock:
